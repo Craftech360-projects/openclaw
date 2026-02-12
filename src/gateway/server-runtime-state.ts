@@ -14,6 +14,7 @@ import type { GatewayWsClient } from "./server/ws-types.js";
 import { CANVAS_HOST_PATH } from "../canvas-host/a2ui.js";
 import { type CanvasHostHandler, createCanvasHostHandler } from "../canvas-host/server.js";
 import { resolveGatewayListenHosts } from "./net.js";
+import { createCheekStreamHandler } from "./cheeko-stream.js";
 import { createGatewayBroadcaster } from "./server-broadcast.js";
 import {
   type ChatRunEntry,
@@ -167,6 +168,12 @@ export async function createGatewayRuntimeState(params: {
     noServer: true,
     maxPayload: MAX_PAYLOAD_BYTES,
   });
+
+  const cheekStream = createCheekStreamHandler({
+    getConfig: () => params.cfg.gateway?.cheeko,
+    log: params.log,
+  });
+
   for (const server of httpServers) {
     attachGatewayUpgradeHandler({
       httpServer: server,
@@ -174,6 +181,7 @@ export async function createGatewayRuntimeState(params: {
       canvasHost,
       clients,
       resolvedAuth: params.resolvedAuth,
+      cheekStreamHandler: cheekStream,
     });
   }
 
@@ -206,5 +214,6 @@ export async function createGatewayRuntimeState(params: {
     removeChatRun,
     chatAbortControllers,
     toolEventRecipients,
+    cheekStreamClose: cheekStream.close,
   };
 }

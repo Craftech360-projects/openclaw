@@ -431,10 +431,21 @@ export function attachGatewayUpgradeHandler(opts: {
   canvasHost: CanvasHostHandler | null;
   clients: Set<GatewayWsClient>;
   resolvedAuth: ResolvedGatewayAuth;
+  cheekStreamHandler?: {
+    handleUpgrade: (
+      req: IncomingMessage,
+      socket: import("node:stream").Duplex,
+      head: Buffer,
+    ) => boolean;
+  };
 }) {
-  const { httpServer, wss, canvasHost, clients, resolvedAuth } = opts;
+  const { httpServer, wss, canvasHost, clients, resolvedAuth, cheekStreamHandler } = opts;
   httpServer.on("upgrade", (req, socket, head) => {
     void (async () => {
+      // Cheeko voice stream WebSocket — intercept before other handlers.
+      if (cheekStreamHandler?.handleUpgrade(req, socket, head)) {
+        return;
+      }
       if (canvasHost) {
         const url = new URL(req.url ?? "/", "http://localhost");
         if (url.pathname === CANVAS_WS_PATH) {

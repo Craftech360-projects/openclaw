@@ -328,6 +328,7 @@ export async function startGatewayServer(
     removeChatRun,
     chatAbortControllers,
     toolEventRecipients,
+    cheekStreamClose,
   } = await createGatewayRuntimeState({
     cfg: cfgAtStart,
     bindHost,
@@ -617,6 +618,7 @@ export async function startGatewayServer(
     clients,
     configReloader,
     browserControl,
+    cheekStreamClose,
     wss,
     httpServer,
     httpServers,

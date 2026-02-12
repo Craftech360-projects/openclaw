@@ -26,6 +26,7 @@ export function createGatewayCloseHandler(params: {
   clients: Set<{ socket: { close: (code: number, reason: string) => void } }>;
   configReloader: { stop: () => Promise<void> };
   browserControl: { stop: () => Promise<void> } | null;
+  cheekStreamClose?: () => void;
   wss: WebSocketServer;
   httpServer: HttpServer;
   httpServers?: HttpServer[];
@@ -107,6 +108,13 @@ export function createGatewayCloseHandler(params: {
     await params.configReloader.stop().catch(() => {});
     if (params.browserControl) {
       await params.browserControl.stop().catch(() => {});
+    }
+    if (params.cheekStreamClose) {
+      try {
+        params.cheekStreamClose();
+      } catch {
+        /* ignore */
+      }
     }
     await new Promise<void>((resolve) => params.wss.close(() => resolve()));
     const servers =
