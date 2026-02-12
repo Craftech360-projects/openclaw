@@ -3,6 +3,8 @@ import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
+import { createSttStream, type CheekSttStream } from "./cheeko-stt.js";
+import { sendChatMessage, type CheekChatHandle } from "./cheeko-chat.js";
 
 export const CHEEKO_STREAM_PATH = "/cheeko/stream";
 
@@ -14,6 +16,12 @@ export type CheekStreamSession = {
   state: "idle" | "listening" | "processing" | "speaking";
   chatHistory: Array<{ role: string; content: string }>;
   createdAt: number;
+  /** Active Deepgram STT stream (created on first audio chunk). */
+  sttStream: CheekSttStream | null;
+  /** Accumulated final transcript segments for the current utterance. */
+  finalTranscript: string;
+  /** Active LLM chat handle (for abort support). */
+  chatHandle: CheekChatHandle | null;
 };
 
 export type CheekStreamLog = {
@@ -156,6 +164,9 @@ export function createCheekStreamHandler(opts: {
       state: "idle",
       chatHistory: [],
       createdAt: Date.now(),
+      sttStream: null,
+      finalTranscript: "",
+      chatHandle: null,
     };
     sessions.set(ws, session);
     log.info(`cheeko: session ${sessionId} started for device ${deviceId}`);
@@ -167,11 +178,50 @@ export function createCheekStreamHandler(opts: {
     sendStatus(ws, "idle");
   }
 
-  function handleAudioChunk(session: CheekStreamSession, _data: Buffer) {
-    // Audio chunk received — STT processing will be implemented in Task 4
+  function ensureSttStream(session: CheekStreamSession): CheekSttStream | null {
+    if (session.sttStream?.isConnected()) return session.sttStream;
+
+    const config = getConfig();
+    if (!config) {
+      sendError(session.ws, "cheeko config unavailable");
+      return null;
+    }
+
+    try {
+      session.finalTranscript = "";
+      session.sttStream = createSttStream({
+        config,
+        log,
+        onTranscript(text, isFinal) {
+          sendJson(session.ws, { type: "transcript", text, partial: !isFinal });
+          if (isFinal) {
+            session.finalTranscript += (session.finalTranscript ? " " : "") + text;
+            log.info(`cheeko-stt: final segment: "${text}"`);
+          }
+        },
+        onError(err) {
+          sendError(session.ws, `STT error: ${String(err)}`);
+        },
+        onClose() {
+          session.sttStream = null;
+        },
+      });
+      return session.sttStream;
+    } catch (err) {
+      sendError(session.ws, `Failed to start STT: ${String(err)}`);
+      return null;
+    }
+  }
+
+  function handleAudioChunk(session: CheekStreamSession, data: Buffer) {
     if (session.state === "idle") {
       session.state = "listening";
       sendStatus(session.ws, "listening");
+    }
+
+    const stt = ensureSttStream(session);
+    if (stt) {
+      stt.sendAudio(data);
     }
   }
 
@@ -182,22 +232,96 @@ export function createCheekStreamHandler(opts: {
     }
     session.state = "processing";
     sendStatus(session.ws, "stt");
-    log.info(`cheeko: session ${session.sessionId} speech ended, processing`);
-    // STT finalization and LLM routing will be implemented in Tasks 4-5
-    // For now, acknowledge and return to idle
-    session.state = "idle";
-    sendStatus(session.ws, "idle");
+    log.info(`cheeko: session ${session.sessionId} speech ended, finalizing STT`);
+
+    // Flush Deepgram's buffer to get any remaining transcript
+    if (session.sttStream?.isConnected()) {
+      session.sttStream.finalize();
+    }
+
+    // Close the STT stream — we're done receiving audio for this turn
+    closeSttStream(session);
+
+    // Log the accumulated transcript
+    const transcript = session.finalTranscript.trim();
+    if (transcript) {
+      log.info(`cheeko: session ${session.sessionId} transcript: "${transcript}"`);
+    }
+
+    if (!transcript) {
+      log.info(`cheeko: session ${session.sessionId} empty transcript, returning to idle`);
+      session.state = "idle";
+      sendStatus(session.ws, "idle");
+      return;
+    }
+
+    // Add user message to conversation history
+    session.chatHistory.push({ role: "user", content: transcript });
+
+    // Route through LLM — use a per-device session key for voice conversations
+    sendStatus(session.ws, "thinking");
+    const sessionKey = `voice:${session.deviceId}`;
+
+    session.chatHandle = sendChatMessage({
+      transcript,
+      sessionKey,
+      log,
+      callbacks: {
+        onTextChunk(text) {
+          // Send text chunk to client (for display and future TTS in Task 6)
+          sendJson(session.ws, { type: "response_text", text, partial: true });
+        },
+        onComplete(fullText) {
+          session.chatHandle = null;
+          if (fullText) {
+            session.chatHistory.push({ role: "assistant", content: fullText });
+          }
+          // Send final text to client
+          sendJson(session.ws, { type: "response_text", text: fullText, partial: false });
+          // TTS streaming will be implemented in Task 6
+          // For now, return to idle after LLM completes
+          session.state = "idle";
+          sendStatus(session.ws, "idle");
+          log.info(`cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars)`);
+        },
+        onError(err) {
+          session.chatHandle = null;
+          sendError(session.ws, `LLM error: ${err}`);
+          session.state = "idle";
+          sendStatus(session.ws, "idle");
+          log.warn(`cheeko: session ${session.sessionId} LLM error: ${err}`);
+        },
+      },
+    });
+  }
+
+  function closeSttStream(session: CheekStreamSession) {
+    if (session.sttStream) {
+      session.sttStream.close();
+      session.sttStream = null;
+    }
   }
 
   function handleCancel(session: CheekStreamSession) {
     log.info(`cheeko: session ${session.sessionId} cancel requested`);
-    // Cancel any active STT/TTS streams (will be implemented in Tasks 4-6)
+    closeSttStream(session);
+    abortChat(session);
+    // Cancel TTS streams (will be implemented in Task 6)
     session.state = "idle";
     sendStatus(session.ws, "idle");
   }
 
+  function abortChat(session: CheekStreamSession) {
+    if (session.chatHandle) {
+      session.chatHandle.abort();
+      session.chatHandle = null;
+    }
+  }
+
   function cleanupSession(session: CheekStreamSession) {
-    // Clean up STT/TTS resources (will be implemented in Tasks 4-6)
+    closeSttStream(session);
+    abortChat(session);
+    // Clean up TTS resources (will be implemented in Task 6)
     sessions.delete(session.ws);
   }
 
