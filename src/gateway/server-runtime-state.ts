@@ -169,6 +169,7 @@ export async function createGatewayRuntimeState(params: {
     maxPayload: MAX_PAYLOAD_BYTES,
   });
 
+  params.log.info(`cheeko: cfg.gateway?.cheeko = ${JSON.stringify(params.cfg.gateway?.cheeko ?? null)}`);
   const cheekStream = createCheekStreamHandler({
     getConfig: () => params.cfg.gateway?.cheeko,
     log: params.log,

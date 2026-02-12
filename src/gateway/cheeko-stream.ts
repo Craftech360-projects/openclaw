@@ -189,7 +189,8 @@ export function createCheekStreamHandler(opts: {
   }
 
   function ensureSttStream(session: CheekStreamSession): CheekSttStream | null {
-    if (session.sttStream?.isConnected()) return session.sttStream;
+    // Return existing stream even if still connecting (avoid creating duplicates)
+    if (session.sttStream) return session.sttStream;
 
     const config = getConfig();
     if (!config) {
@@ -251,21 +252,32 @@ export function createCheekStreamHandler(opts: {
       session.sttStream.finalize();
     }
 
-    // Close the STT stream — we're done receiving audio for this turn
-    closeSttStream(session);
+    // Wait for Deepgram to send back final transcript before proceeding.
+    // The STT stream will deliver remaining transcripts via onTranscript callback.
+    // Give Deepgram up to 2s to flush, then proceed with whatever we have.
+    const waitForTranscript = () => {
+      closeSttStream(session);
 
-    // Log the accumulated transcript
-    const transcript = session.finalTranscript.trim();
-    if (transcript) {
-      log.info(`cheeko: session ${session.sessionId} transcript: "${transcript}"`);
-    }
+      const transcript = session.finalTranscript.trim();
+      if (transcript) {
+        log.info(`cheeko: session ${session.sessionId} transcript: "${transcript}"`);
+      }
 
-    if (!transcript) {
-      log.info(`cheeko: session ${session.sessionId} empty transcript, returning to idle`);
-      session.state = "idle";
-      sendStatus(session.ws, "idle");
-      return;
-    }
+      if (!transcript) {
+        log.info(`cheeko: session ${session.sessionId} empty transcript, returning to idle`);
+        session.state = "idle";
+        sendStatus(session.ws, "idle");
+        return;
+      }
+
+      proceedWithTranscript(session, transcript);
+    };
+
+    // Delay to allow final transcript to arrive from Deepgram
+    setTimeout(waitForTranscript, 800);
+  }
+
+  function proceedWithTranscript(session: CheekStreamSession, transcript: string) {
 
     // Add user message to conversation history
     session.chatHistory.push({ role: "user", content: transcript });
@@ -399,11 +411,14 @@ export function createCheekStreamHandler(opts: {
     }
 
     const config = getConfig();
+    log.info(`cheeko: handleUpgrade config=${JSON.stringify(config ?? null)}`);
     if (!config?.enabled) {
+      log.warn(`cheeko: rejecting upgrade — enabled=${config?.enabled}, config exists=${config != null}`);
       socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return true;
     }
+    log.info("cheeko: upgrade accepted, proceeding with WebSocket handshake");
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
