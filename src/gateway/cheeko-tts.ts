@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import OpusScript from "opusscript";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
 import type { CheekStreamLog } from "./cheeko-stream.js";
+import { streamElevenLabsTts } from "./cheeko-tts-elevenlabs.js";
 
 /** 24kHz, mono, 20ms frame → 480 samples per frame, 2 bytes per sample = 960 bytes per frame. */
 const TTS_SAMPLE_RATE = 24000;
@@ -35,11 +36,27 @@ function createOpusEncoder(): OpusScript {
 }
 
 /**
- * Streams TTS audio for a single text chunk.
- * Uses OpenAI TTS API to generate PCM audio, encodes to Opus frames,
- * and delivers each frame via the onOpusFrame callback.
+ * Streams TTS audio for a single text chunk using the configured provider.
+ * Delegates to OpenAI or ElevenLabs based on config.ttsProvider.
  */
 export function streamTts(opts: {
+  text: string;
+  config: CheekStreamConfig;
+  log: CheekStreamLog;
+  callbacks: CheekTtsCallbacks;
+}): CheekTtsHandle {
+  const provider = opts.config.ttsProvider || "openai";
+  if (provider === "elevenlabs") {
+    return streamElevenLabsTts(opts);
+  }
+  return streamOpenAiTts(opts);
+}
+
+/**
+ * Streams TTS audio for a single text chunk using OpenAI TTS API.
+ * Generates PCM audio, encodes to Opus frames, and delivers via callbacks.
+ */
+function streamOpenAiTts(opts: {
   text: string;
   config: CheekStreamConfig;
   log: CheekStreamLog;

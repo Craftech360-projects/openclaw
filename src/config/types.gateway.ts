@@ -218,12 +218,20 @@ export type CheekStreamConfig = {
   deepgramApiKey?: string;
   /** Deepgram STT model (default: nova-2). */
   deepgramModel?: string;
+  /** TTS provider to use: "openai" or "elevenlabs" (default: "openai"). */
+  ttsProvider?: "openai" | "elevenlabs";
   /** OpenAI API key for TTS (fallback: OPENAI_API_KEY env var). */
   openaiApiKey?: string;
   /** OpenAI TTS model (default: gpt-4o-mini-tts). */
   ttsModel?: string;
   /** OpenAI TTS voice (default: alloy). */
   ttsVoice?: string;
+  /** ElevenLabs API key (fallback: ELEVENLABS_API_KEY env var). */
+  elevenlabsApiKey?: string;
+  /** ElevenLabs voice ID (default: pMsXgVXv3BLzUgSXRplE). */
+  elevenlabsVoiceId?: string;
+  /** ElevenLabs model ID (default: eleven_turbo_v2). */
+  elevenlabsModelId?: string;
 };
 
 export type GatewayConfig = {

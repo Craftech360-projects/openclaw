@@ -516,9 +516,13 @@ export const OpenClawSchema = z
             enabled: z.boolean().optional(),
             deepgramApiKey: z.string().optional(),
             deepgramModel: z.string().optional(),
+            ttsProvider: z.enum(["openai", "elevenlabs"]).optional(),
             openaiApiKey: z.string().optional(),
             ttsModel: z.string().optional(),
             ttsVoice: z.string().optional(),
+            elevenlabsApiKey: z.string().optional(),
+            elevenlabsVoiceId: z.string().optional(),
+            elevenlabsModelId: z.string().optional(),
           })
           .strict()
           .optional(),
