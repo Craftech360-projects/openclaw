@@ -408,6 +408,18 @@ const FIELD_HELP: Record<string, string> = {
     "Extra node.invoke commands to allow beyond the gateway defaults (array of command strings).",
   "gateway.nodes.denyCommands":
     "Commands to block even if present in node claims or default allowlist.",
+  "gateway.cheeko.enabled":
+    "Enable the /cheeko/stream WebSocket endpoint for voice streaming (STT → LLM → TTS).",
+  "gateway.cheeko.deepgramApiKey":
+    "Deepgram API key for streaming speech-to-text (fallback: DEEPGRAM_API_KEY env var).",
+  "gateway.cheeko.deepgramModel":
+    'Deepgram STT model to use (default: "nova-2").',
+  "gateway.cheeko.openaiApiKey":
+    "OpenAI API key for text-to-speech (fallback: OPENAI_API_KEY env var).",
+  "gateway.cheeko.ttsModel":
+    'OpenAI TTS model to use (default: "gpt-4o-mini-tts").',
+  "gateway.cheeko.ttsVoice":
+    'OpenAI TTS voice to use (default: "alloy").',
   "nodeHost.browserProxy.enabled": "Expose the local browser control server via node proxy.",
   "nodeHost.browserProxy.allowProfiles":
     "Optional allowlist of browser profile names exposed via the node proxy.",
@@ -742,6 +754,11 @@ const FIELD_PLACEHOLDERS: Record<string, string> = {
   "gateway.controlUi.root": "dist/control-ui",
   "gateway.controlUi.allowedOrigins": "https://control.example.com",
   "channels.mattermost.baseUrl": "https://chat.example.com",
+  "gateway.cheeko.deepgramApiKey": "dg-xxxxxxxxxxxx",
+  "gateway.cheeko.deepgramModel": "nova-2",
+  "gateway.cheeko.openaiApiKey": "sk-xxxxxxxxxxxx",
+  "gateway.cheeko.ttsModel": "gpt-4o-mini-tts",
+  "gateway.cheeko.ttsVoice": "alloy",
   "agents.list[].identity.avatar": "avatars/openclaw.png",
 };
 

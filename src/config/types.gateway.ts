@@ -211,6 +211,21 @@ export type GatewayNodesConfig = {
   denyCommands?: string[];
 };
 
+export type CheekStreamConfig = {
+  /** Enable the /cheeko/stream WebSocket endpoint for voice streaming. */
+  enabled?: boolean;
+  /** Deepgram API key (fallback: DEEPGRAM_API_KEY env var). */
+  deepgramApiKey?: string;
+  /** Deepgram STT model (default: nova-2). */
+  deepgramModel?: string;
+  /** OpenAI API key for TTS (fallback: OPENAI_API_KEY env var). */
+  openaiApiKey?: string;
+  /** OpenAI TTS model (default: gpt-4o-mini-tts). */
+  ttsModel?: string;
+  /** OpenAI TTS voice (default: alloy). */
+  ttsVoice?: string;
+};
+
 export type GatewayConfig = {
   /** Single multiplexed port for Gateway WS + HTTP (default: 18789). */
   port?: number;
@@ -245,4 +260,6 @@ export type GatewayConfig = {
    * `x-real-ip`) to determine the client IP for local pairing and HTTP checks.
    */
   trustedProxies?: string[];
+  /** Cheeko voice streaming endpoint configuration. */
+  cheeko?: CheekStreamConfig;
 };
