@@ -25,6 +25,10 @@ export type CheekStreamSession = {
   chatHandle: CheekChatHandle | null;
   /** Active TTS pipeline (for streaming audio back). */
   ttsPipeline: ReturnType<typeof createTtsPipeline> | null;
+  /** Timestamp (ms) when speech_end was received — for latency measurement. */
+  speechEndAt: number;
+  /** Whether the first audio frame for the current response has been sent. */
+  firstAudioSent: boolean;
 };
 
 export type CheekStreamLog = {
@@ -171,6 +175,8 @@ export function createCheekStreamHandler(opts: {
       finalTranscript: "",
       chatHandle: null,
       ttsPipeline: null,
+      speechEndAt: 0,
+      firstAudioSent: false,
     };
     sessions.set(ws, session);
     log.info(`cheeko: session ${sessionId} started for device ${deviceId}`);
@@ -235,6 +241,8 @@ export function createCheekStreamHandler(opts: {
       return;
     }
     session.state = "processing";
+    session.speechEndAt = Date.now();
+    session.firstAudioSent = false;
     sendStatus(session.ws, "stt");
     log.info(`cheeko: session ${session.sessionId} speech ended, finalizing STT`);
 
@@ -275,6 +283,12 @@ export function createCheekStreamHandler(opts: {
         onOpusFrame(frame) {
           // Send Opus audio as binary WebSocket frame
           if (session.ws.readyState === WebSocket.OPEN) {
+            if (!session.firstAudioSent && session.speechEndAt > 0) {
+              const latencyMs = Date.now() - session.speechEndAt;
+              log.info(`cheeko: session ${session.sessionId} latency speech_end→first_audio: ${latencyMs}ms`);
+              sendJson(session.ws, { type: "latency", speechEndToFirstAudio: latencyMs });
+              session.firstAudioSent = true;
+            }
             session.ws.send(frame);
           }
         },
