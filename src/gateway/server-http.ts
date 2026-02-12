@@ -15,7 +15,9 @@ import {
   A2UI_PATH,
   CANVAS_HOST_PATH,
   CANVAS_WS_PATH,
+  VOICE_PATH,
   handleA2uiHttpRequest,
+  handleVoiceHttpRequest,
 } from "../canvas-host/a2ui.js";
 import { loadConfig } from "../config/config.js";
 import { handleSlackHttpRequest } from "../slack/http/index.js";
@@ -80,7 +82,9 @@ function isCanvasPath(pathname: string): boolean {
     pathname.startsWith(`${A2UI_PATH}/`) ||
     pathname === CANVAS_HOST_PATH ||
     pathname.startsWith(`${CANVAS_HOST_PATH}/`) ||
-    pathname === CANVAS_WS_PATH
+    pathname === CANVAS_WS_PATH ||
+    pathname === VOICE_PATH ||
+    pathname.startsWith(`${VOICE_PATH}/`)
   );
 }
 
@@ -386,6 +390,9 @@ export function createGatewayHttpServer(opts: {
           }
         }
         if (await handleA2uiHttpRequest(req, res)) {
+          return;
+        }
+        if (await handleVoiceHttpRequest(req, res)) {
           return;
         }
         if (await canvasHost.handleHttpRequest(req, res)) {

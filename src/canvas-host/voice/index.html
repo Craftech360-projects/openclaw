@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpenClaw Voice</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: #0d0d0f; color: #e0e0e4; font: 15px/1.5 -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { min-height: 100%; display: flex; flex-direction: column; align-items: center; padding: 24px 16px; }
+  header { width: min(640px, 100%); display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: 0.2px; }
+  .nav-link { margin-left: auto; font-size: 13px; color: rgba(255,255,255,0.5); text-decoration: none; padding: 4px 10px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; transition: all 0.15s; }
+  .nav-link:hover { color: #fff; border-color: rgba(255,255,255,0.3); background: rgba(255,255,255,0.06); }
+  .status-badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .status-idle { background: rgba(36,224,138,0.15); color: #24e08a; }
+  .status-connecting { background: rgba(255,200,50,0.15); color: #ffc832; }
+  .status-listening { background: rgba(60,140,255,0.15); color: #3c8cff; }
+  .status-stt { background: rgba(160,120,255,0.15); color: #a078ff; }
+  .status-thinking { background: rgba(255,200,50,0.15); color: #ffc832; }
+  .status-speaking { background: rgba(200,80,255,0.15); color: #c850ff; }
+  .status-error { background: rgba(255,80,80,0.15); color: #ff5050; }
+  .transcript-area { width: min(640px, 100%); flex: 1; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 14px 16px; overflow-y: auto; min-height: 200px; max-height: 60vh; margin-bottom: 16px; }
+  .msg { margin-bottom: 10px; animation: fadeIn 0.15s ease; }
+  .msg-user .msg-label { color: #3c8cff; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .msg-ai .msg-label { color: #c850ff; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .msg-text { margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+  .msg-partial { opacity: 0.6; font-style: italic; }
+  .controls { width: min(640px, 100%); display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  #talkBtn { appearance: none; border: 2px solid rgba(60,140,255,0.4); background: rgba(60,140,255,0.12); color: #fff; width: 100%; max-width: 300px; padding: 14px 24px; border-radius: 14px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.15s ease; user-select: none; -webkit-user-select: none; }
+  #talkBtn:hover { background: rgba(60,140,255,0.2); border-color: rgba(60,140,255,0.6); }
+  #talkBtn.active { background: rgba(255,60,60,0.2); border-color: rgba(255,60,60,0.5); color: #ff6060; }
+  #talkBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .hint { font-size: 12px; opacity: 0.5; }
+  .latency { font-size: 11px; opacity: 0.4; margin-top: 4px; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>OpenClaw Voice</h1>
+    <span id="statusBadge" class="status-badge status-connecting">Connecting</span>
+    <a href="/chat" class="nav-link">Text Chat</a>
+  </header>
+  <div id="transcript" class="transcript-area"></div>
+  <div class="controls">
+    <button id="talkBtn" disabled>Hold to Talk</button>
+    <div class="hint">or hold <kbd>Space</kbd></div>
+    <div id="latencyInfo" class="latency"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const statusBadge = document.getElementById("statusBadge");
+  const transcriptArea = document.getElementById("transcript");
+  const talkBtn = document.getElementById("talkBtn");
+  const latencyInfo = document.getElementById("latencyInfo");
+
+  let ws = null;
+  let audioCtx = null;
+  let micStream = null;
+  let micProcessor = null;
+  let isHolding = false;
+  let currentState = "disconnected";
+  let partialTranscriptEl = null;
+  let currentResponseEl = null;
+
+  // PCM playback queue: 24kHz 16-bit mono LE
+  const TTS_SAMPLE_RATE = 24000;
+  let playbackQueue = [];
+  let isPlaying = false;
+
+  function setStatus(state, label) {
+    currentState = state;
+    statusBadge.textContent = label || state;
+    statusBadge.className = "status-badge status-" + state;
+    talkBtn.disabled = (state === "connecting" || state === "error" || state === "disconnected");
+  }
+
+  function scrollDown() {
+    transcriptArea.scrollTop = transcriptArea.scrollHeight;
+  }
+
+  function addUserMessage(text) {
+    if (partialTranscriptEl) {
+      partialTranscriptEl.remove();
+      partialTranscriptEl = null;
+    }
+    const div = document.createElement("div");
+    div.className = "msg msg-user";
+    div.innerHTML = '<div class="msg-label">You</div><div class="msg-text"></div>';
+    div.querySelector(".msg-text").textContent = text;
+    transcriptArea.appendChild(div);
+    scrollDown();
+  }
+
+  function updatePartialTranscript(text) {
+    if (!partialTranscriptEl) {
+      partialTranscriptEl = document.createElement("div");
+      partialTranscriptEl.className = "msg msg-user";
+      partialTranscriptEl.innerHTML = '<div class="msg-label">You</div><div class="msg-text msg-partial"></div>';
+      transcriptArea.appendChild(partialTranscriptEl);
+    }
+    partialTranscriptEl.querySelector(".msg-text").textContent = text;
+    scrollDown();
+  }
+
+  function addAiChunk(text, partial) {
+    if (!currentResponseEl) {
+      currentResponseEl = document.createElement("div");
+      currentResponseEl.className = "msg msg-ai";
+      currentResponseEl.innerHTML = '<div class="msg-label">AI</div><div class="msg-text"></div>';
+      transcriptArea.appendChild(currentResponseEl);
+    }
+    const textEl = currentResponseEl.querySelector(".msg-text");
+    if (partial) {
+      textEl.textContent += text;
+    } else {
+      textEl.textContent = text;
+      currentResponseEl = null;
+    }
+    scrollDown();
+  }
+
+  // --- PCM Audio Playback ---
+
+  function ensureAudioCtx() {
+    if (!audioCtx) {
+      audioCtx = new AudioContext({ sampleRate: TTS_SAMPLE_RATE });
+    }
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume();
+    }
+    return audioCtx;
+  }
+
+  function queuePcmFrame(pcmBuffer) {
+    playbackQueue.push(pcmBuffer);
+    if (!isPlaying) {
+      drainPlaybackQueue();
+    }
+  }
+
+  function drainPlaybackQueue() {
+    if (playbackQueue.length === 0) {
+      isPlaying = false;
+      return;
+    }
+    isPlaying = true;
+    const ctx = ensureAudioCtx();
+
+    // Merge all queued buffers into one for smoother playback
+    let totalSamples = 0;
+    for (const buf of playbackQueue) {
+      totalSamples += buf.length / 2; // 16-bit = 2 bytes per sample
+    }
+    const audioBuffer = ctx.createBuffer(1, totalSamples, TTS_SAMPLE_RATE);
+    const channelData = audioBuffer.getChannelData(0);
+    let offset = 0;
+    for (const buf of playbackQueue) {
+      const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      for (let i = 0; i < buf.length; i += 2) {
+        channelData[offset++] = view.getInt16(i, true) / 32768;
+      }
+    }
+    playbackQueue = [];
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.onended = () => drainPlaybackQueue();
+    source.start();
+  }
+
+  function stopPlayback() {
+    playbackQueue = [];
+    isPlaying = false;
+  }
+
+  // --- Mic Capture (16kHz mono 16-bit PCM) ---
+
+  const MIC_SAMPLE_RATE = 16000;
+  const MIC_CHUNK_MS = 60;
+  const MIC_CHUNK_SAMPLES = MIC_SAMPLE_RATE * MIC_CHUNK_MS / 1000; // 960
+
+  async function startMic() {
+    if (micStream) return;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { sampleRate: { ideal: MIC_SAMPLE_RATE }, channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      });
+    } catch (err) {
+      setStatus("error", "Mic denied");
+      return;
+    }
+
+    const micCtx = new AudioContext({ sampleRate: MIC_SAMPLE_RATE });
+    const source = micCtx.createMediaStreamSource(micStream);
+
+    // Use ScriptProcessorNode (widely supported, simple)
+    const bufferSize = 4096;
+    micProcessor = micCtx.createScriptProcessor(bufferSize, 1, 1);
+    micProcessor._micCtx = micCtx;
+
+    let pcmAccumulator = new Float32Array(0);
+
+    micProcessor.onaudioprocess = (e) => {
+      if (!isHolding || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const input = e.inputBuffer.getChannelData(0);
+
+      // Accumulate samples
+      const combined = new Float32Array(pcmAccumulator.length + input.length);
+      combined.set(pcmAccumulator);
+      combined.set(input, pcmAccumulator.length);
+      pcmAccumulator = combined;
+
+      // Send chunks of MIC_CHUNK_SAMPLES
+      while (pcmAccumulator.length >= MIC_CHUNK_SAMPLES) {
+        const chunk = pcmAccumulator.slice(0, MIC_CHUNK_SAMPLES);
+        pcmAccumulator = pcmAccumulator.slice(MIC_CHUNK_SAMPLES);
+
+        // Convert float32 [-1, 1] to int16 LE
+        const pcm16 = new ArrayBuffer(chunk.length * 2);
+        const view = new DataView(pcm16);
+        for (let i = 0; i < chunk.length; i++) {
+          const s = Math.max(-1, Math.min(1, chunk[i]));
+          view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        ws.send(pcm16);
+      }
+    };
+
+    source.connect(micProcessor);
+    micProcessor.connect(micCtx.destination);
+  }
+
+  function stopMic() {
+    if (micProcessor) {
+      micProcessor.disconnect();
+      if (micProcessor._micCtx) {
+        micProcessor._micCtx.close();
+      }
+      micProcessor = null;
+    }
+    if (micStream) {
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+    }
+  }
+
+  // --- WebSocket Connection ---
+
+  function connect() {
+    setStatus("connecting", "Connecting");
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/cheeko/stream`);
+    ws.binaryType = "arraybuffer";
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        type: "hello",
+        deviceId: "web-" + Math.random().toString(36).slice(2, 8),
+        clientType: "web"
+      }));
+    };
+
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        // Binary: PCM audio frame from TTS
+        queuePcmFrame(new Uint8Array(ev.data));
+        return;
+      }
+      const msg = JSON.parse(ev.data);
+      handleServerMessage(msg);
+    };
+
+    ws.onclose = () => {
+      setStatus("disconnected", "Disconnected");
+      talkBtn.disabled = true;
+      setTimeout(connect, 3000);
+    };
+
+    ws.onerror = () => {
+      setStatus("error", "Error");
+    };
+  }
+
+  function handleServerMessage(msg) {
+    switch (msg.type) {
+      case "hello_ack":
+        setStatus("idle", "Ready");
+        break;
+      case "status":
+        handleStatusChange(msg.stage);
+        break;
+      case "transcript":
+        if (msg.partial) {
+          updatePartialTranscript(msg.text);
+        } else {
+          // Final transcript segment — will be accumulated server-side
+        }
+        break;
+      case "response_text":
+        if (msg.partial) {
+          addAiChunk(msg.text, true);
+        } else {
+          // Complete — finalize the AI message
+          if (currentResponseEl) {
+            currentResponseEl.querySelector(".msg-text").textContent = msg.text;
+            currentResponseEl = null;
+          }
+        }
+        break;
+      case "audio_end":
+        // TTS finished
+        break;
+      case "latency":
+        if (msg.speechEndToFirstAudio) {
+          latencyInfo.textContent = `Latency: ${msg.speechEndToFirstAudio}ms`;
+        }
+        break;
+      case "error":
+        console.warn("Server error:", msg.message);
+        break;
+    }
+  }
+
+  function handleStatusChange(stage) {
+    switch (stage) {
+      case "idle":
+        setStatus("idle", "Ready");
+        break;
+      case "listening":
+        setStatus("listening", "Listening");
+        break;
+      case "stt":
+        setStatus("stt", "Transcribing");
+        // Add user message from partial transcript
+        if (partialTranscriptEl) {
+          const text = partialTranscriptEl.querySelector(".msg-text").textContent;
+          partialTranscriptEl.remove();
+          partialTranscriptEl = null;
+          if (text) addUserMessage(text);
+        }
+        break;
+      case "thinking":
+        setStatus("thinking", "Thinking");
+        break;
+      case "speaking":
+        setStatus("speaking", "Speaking");
+        break;
+    }
+  }
+
+  // --- Push-to-Talk Controls ---
+
+  async function startTalking() {
+    if (isHolding) return;
+    isHolding = true;
+    talkBtn.classList.add("active");
+    talkBtn.textContent = "Release to Send";
+    stopPlayback();
+    currentResponseEl = null;
+
+    // Cancel any in-progress response
+    if (ws && ws.readyState === WebSocket.OPEN && (currentState === "speaking" || currentState === "thinking")) {
+      ws.send(JSON.stringify({ type: "cancel" }));
+    }
+
+    await startMic();
+  }
+
+  function stopTalking() {
+    if (!isHolding) return;
+    isHolding = false;
+    talkBtn.classList.remove("active");
+    talkBtn.textContent = "Hold to Talk";
+    stopMic();
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "speech_end" }));
+    }
+  }
+
+  // Button events
+  talkBtn.addEventListener("mousedown", (e) => { e.preventDefault(); startTalking(); });
+  talkBtn.addEventListener("mouseup", stopTalking);
+  talkBtn.addEventListener("mouseleave", stopTalking);
+  talkBtn.addEventListener("touchstart", (e) => { e.preventDefault(); startTalking(); });
+  talkBtn.addEventListener("touchend", stopTalking);
+
+  // Spacebar
+  document.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && !e.repeat && e.target === document.body) {
+      e.preventDefault();
+      startTalking();
+    }
+  });
+  document.addEventListener("keyup", (e) => {
+    if (e.code === "Space") {
+      e.preventDefault();
+      stopTalking();
+    }
+  });
+
+  // Start
+  connect();
+})();
+</script>
+</body>
+</html>

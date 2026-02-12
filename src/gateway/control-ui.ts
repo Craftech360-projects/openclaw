@@ -178,15 +178,50 @@ function injectControlUiConfig(html: string, opts: ControlUiInjectionOpts): stri
       assistantAvatar ?? DEFAULT_ASSISTANT_IDENTITY.avatar,
     )};` +
     `</script>`;
+
+  // Floating voice-chat button — only visible on chat routes
+  const voiceBtn =
+    `<style>` +
+    `#oc-voice-fab{position:fixed;bottom:24px;right:24px;z-index:9999;width:48px;height:48px;border-radius:50%;border:none;` +
+    `background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,0.3);` +
+    `display:none;align-items:center;justify-content:center;transition:transform .15s,box-shadow .15s;font-size:20px;}` +
+    `#oc-voice-fab:hover{transform:scale(1.1);box-shadow:0 6px 20px rgba(99,102,241,0.5);}` +
+    `</style>` +
+    `<a id="oc-voice-fab" href="/__openclaw__/voice/" title="Voice Chat">` +
+    `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
+    `<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>` +
+    `<path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>` +
+    `</svg></a>` +
+    `<script>` +
+    `(function(){var b=document.getElementById("oc-voice-fab");` +
+    `function u(){b.style.display=location.pathname.match(/\\/chat/)||location.pathname==="/"?"flex":"none"}` +
+    `u();window.addEventListener("popstate",u);` +
+    `new MutationObserver(u).observe(document.body,{childList:true,subtree:true});` +
+    `})();` +
+    `</script>`;
+
   // Check if already injected
   if (html.includes("__OPENCLAW_ASSISTANT_NAME__")) {
     return html;
   }
-  const headClose = html.indexOf("</head>");
+
+  // Inject config script into <head>
+  let result = html;
+  const headClose = result.indexOf("</head>");
   if (headClose !== -1) {
-    return `${html.slice(0, headClose)}${script}${html.slice(headClose)}`;
+    result = `${result.slice(0, headClose)}${script}${result.slice(headClose)}`;
+  } else {
+    result = `${script}${result}`;
   }
-  return `${script}${html}`;
+
+  // Inject voice button before </body>
+  const bodyClose = result.lastIndexOf("</body>");
+  if (bodyClose !== -1) {
+    result = `${result.slice(0, bodyClose)}${voiceBtn}${result.slice(bodyClose)}`;
+  } else {
+    result += voiceBtn;
+  }
+  return result;
 }
 
 interface ServeIndexHtmlOpts {

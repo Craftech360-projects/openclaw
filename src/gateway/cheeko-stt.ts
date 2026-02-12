@@ -1,7 +1,7 @@
 import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 import type { ListenLiveClient } from "@deepgram/sdk";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
-import type { CheekStreamLog } from "./cheeko-stream.js";
+import type { CheekAudioFormat, CheekStreamLog } from "./cheeko-stream.js";
 
 export type TranscriptCallback = (text: string, isFinal: boolean) => void;
 
@@ -23,11 +23,13 @@ export type CheekSttStream = {
 export function createSttStream(opts: {
   config: CheekStreamConfig;
   log: CheekStreamLog;
+  audioFormat?: CheekAudioFormat;
   onTranscript: TranscriptCallback;
   onError: (err: unknown) => void;
   onClose: () => void;
 }): CheekSttStream {
   const { config, log, onTranscript, onError, onClose } = opts;
+  const audioFormat = opts.audioFormat ?? "opus";
 
   const apiKey = config.deepgramApiKey || process.env.DEEPGRAM_API_KEY;
   if (!apiKey) {
@@ -38,10 +40,14 @@ export function createSttStream(opts: {
 
   const deepgram = createClient(apiKey);
 
+  // PCM web clients send 16kHz 16-bit mono linear PCM; native clients send Opus
+  const dgEncoding = audioFormat === "pcm" ? "linear16" : "opus";
+  log.info(`cheeko-stt: opening Deepgram connection (encoding: ${dgEncoding})`);
+
   const connection: ListenLiveClient = deepgram.listen.live({
     model,
     language: "en",
-    encoding: "opus",
+    encoding: dgEncoding,
     sample_rate: 16000,
     channels: 1,
     punctuate: true,
@@ -54,7 +60,7 @@ export function createSttStream(opts: {
 
   let closed = false;
   let ready = false;
-  const pendingFrames: ArrayBuffer[] = [];
+  const pendingFrames: (ArrayBuffer | SharedArrayBuffer)[] = [];
 
   connection.on(LiveTranscriptionEvents.Open, () => {
     log.info("cheeko-stt: Deepgram connection opened");

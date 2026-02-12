@@ -130,10 +130,15 @@ export function sendChatMessage(opts: {
     verboseLevel: "off",
   });
 
-  // Build MsgContext matching the pattern from chat.send handler
+  // Build MsgContext matching the pattern from chat.send handler.
+  // Instruct the agent to reply with plain text only — audio synthesis is handled
+  // externally by the cheeko voice pipeline (STT → LLM → TTS).
+  const voicePrefix =
+    "[Voice conversation — respond with plain text only. Do NOT use the tts tool. Audio is handled by the voice pipeline.]\n";
+
   const ctx: MsgContext = {
     Body: transcript,
-    BodyForAgent: transcript,
+    BodyForAgent: voicePrefix + transcript,
     BodyForCommands: transcript,
     RawBody: transcript,
     CommandBody: transcript,

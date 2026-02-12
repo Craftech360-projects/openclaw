@@ -9,6 +9,9 @@ import { createTtsPipeline } from "./cheeko-tts.js";
 
 export const CHEEKO_STREAM_PATH = "/cheeko/stream";
 
+/** Audio format negotiated per connection. */
+export type CheekAudioFormat = "opus" | "pcm";
+
 /** Per-connection session state. */
 export type CheekStreamSession = {
   sessionId: string;
@@ -17,6 +20,8 @@ export type CheekStreamSession = {
   state: "idle" | "listening" | "processing" | "speaking";
   chatHistory: Array<{ role: string; content: string }>;
   createdAt: number;
+  /** Audio format for this session (opus for native clients, pcm for web). */
+  audioFormat: CheekAudioFormat;
   /** Active Deepgram STT stream (created on first audio chunk). */
   sttStream: CheekSttStream | null;
   /** Accumulated final transcript segments for the current utterance. */
@@ -38,7 +43,7 @@ export type CheekStreamLog = {
 };
 
 type ControlMessage =
-  | { type: "hello"; deviceId?: string; token?: string }
+  | { type: "hello"; deviceId?: string; token?: string; clientType?: string }
   | { type: "speech_end" }
   | { type: "cancel" };
 
@@ -154,7 +159,7 @@ export function createCheekStreamHandler(opts: {
     });
   });
 
-  function handleHello(ws: WebSocket, msg: { type: "hello"; deviceId?: string; token?: string }) {
+  function handleHello(ws: WebSocket, msg: { type: "hello"; deviceId?: string; token?: string; clientType?: string }) {
     const config = getConfig();
     if (!config?.enabled) {
       sendError(ws, "cheeko stream endpoint is disabled");
@@ -163,6 +168,7 @@ export function createCheekStreamHandler(opts: {
     }
 
     const deviceId = msg.deviceId || `device-${randomUUID().slice(0, 8)}`;
+    const audioFormat: CheekAudioFormat = msg.clientType === "web" ? "pcm" : "opus";
     const sessionId = randomUUID();
     const session: CheekStreamSession = {
       sessionId,
@@ -171,6 +177,7 @@ export function createCheekStreamHandler(opts: {
       state: "idle",
       chatHistory: [],
       createdAt: Date.now(),
+      audioFormat,
       sttStream: null,
       finalTranscript: "",
       chatHandle: null,
@@ -179,7 +186,7 @@ export function createCheekStreamHandler(opts: {
       firstAudioSent: false,
     };
     sessions.set(ws, session);
-    log.info(`cheeko: session ${sessionId} started for device ${deviceId}`);
+    log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat})`);
     sendJson(ws, {
       type: "hello_ack",
       sessionId,
@@ -203,6 +210,7 @@ export function createCheekStreamHandler(opts: {
       session.sttStream = createSttStream({
         config,
         log,
+        audioFormat: session.audioFormat,
         onTranscript(text, isFinal) {
           sendJson(session.ws, { type: "transcript", text, partial: !isFinal });
           if (isFinal) {
@@ -289,21 +297,22 @@ export function createCheekStreamHandler(opts: {
     // Create TTS pipeline to stream audio back to client
     const config = getConfig();
     if (config) {
+      const onAudioFrame = (frame: Buffer) => {
+        if (session.ws.readyState === WebSocket.OPEN) {
+          if (!session.firstAudioSent && session.speechEndAt > 0) {
+            const latencyMs = Date.now() - session.speechEndAt;
+            log.info(`cheeko: session ${session.sessionId} latency speech_end→first_audio: ${latencyMs}ms`);
+            sendJson(session.ws, { type: "latency", speechEndToFirstAudio: latencyMs });
+            session.firstAudioSent = true;
+          }
+          session.ws.send(frame);
+        }
+      };
       session.ttsPipeline = createTtsPipeline({
         config,
         log,
-        onOpusFrame(frame) {
-          // Send Opus audio as binary WebSocket frame
-          if (session.ws.readyState === WebSocket.OPEN) {
-            if (!session.firstAudioSent && session.speechEndAt > 0) {
-              const latencyMs = Date.now() - session.speechEndAt;
-              log.info(`cheeko: session ${session.sessionId} latency speech_end→first_audio: ${latencyMs}ms`);
-              sendJson(session.ws, { type: "latency", speechEndToFirstAudio: latencyMs });
-              session.firstAudioSent = true;
-            }
-            session.ws.send(frame);
-          }
-        },
+        outputFormat: session.audioFormat,
+        onAudioFrame,
         onComplete() {
           session.ttsPipeline = null;
           sendJson(session.ws, { type: "audio_end" });

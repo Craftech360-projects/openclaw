@@ -10,6 +10,8 @@ export const CANVAS_HOST_PATH = "/__openclaw__/canvas";
 
 export const CANVAS_WS_PATH = "/__openclaw__/ws";
 
+export const VOICE_PATH = "/__openclaw__/voice";
+
 let cachedA2uiRootReal: string | null | undefined;
 let resolvingA2uiRoot: Promise<string | null> | null = null;
 
@@ -215,4 +217,71 @@ export async function handleA2uiHttpRequest(
   res.setHeader("Content-Type", mime);
   res.end(await fs.readFile(filePath));
   return true;
+}
+
+let cachedVoiceRootReal: string | null | undefined;
+
+async function resolveVoiceRoot(): Promise<string | null> {
+  if (cachedVoiceRootReal !== undefined) return cachedVoiceRootReal;
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(here, "voice"),
+    path.resolve(here, "../../src/canvas-host/voice"),
+    path.resolve(process.cwd(), "src/canvas-host/voice"),
+    path.resolve(process.cwd(), "dist/canvas-host/voice"),
+  ];
+  for (const dir of candidates) {
+    try {
+      await fs.stat(path.join(dir, "index.html"));
+      cachedVoiceRootReal = await fs.realpath(dir);
+      return cachedVoiceRootReal;
+    } catch {
+      // try next
+    }
+  }
+  cachedVoiceRootReal = null;
+  return null;
+}
+
+export async function handleVoiceHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<boolean> {
+  const urlRaw = req.url;
+  if (!urlRaw) return false;
+
+  const url = new URL(urlRaw, "http://localhost");
+  if (url.pathname !== VOICE_PATH && !url.pathname.startsWith(`${VOICE_PATH}/`)) {
+    return false;
+  }
+
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    res.statusCode = 405;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Method Not Allowed");
+    return true;
+  }
+
+  const voiceRoot = await resolveVoiceRoot();
+  if (!voiceRoot) {
+    res.statusCode = 503;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("Voice page assets not found");
+    return true;
+  }
+
+  // Serve index.html for any sub-path (single page)
+  const filePath = path.join(voiceRoot, "index.html");
+  try {
+    const html = await fs.readFile(filePath, "utf8");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.end(html);
+    return true;
+  } catch {
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end("not found");
+    return true;
+  }
 }

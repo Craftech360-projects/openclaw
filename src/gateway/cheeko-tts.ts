@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import OpusScript from "opusscript";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
-import type { CheekStreamLog } from "./cheeko-stream.js";
+import type { CheekAudioFormat, CheekStreamLog } from "./cheeko-stream.js";
 import { streamElevenLabsTts } from "./cheeko-tts-elevenlabs.js";
 
 /** 24kHz, mono, 20ms frame → 480 samples per frame, 2 bytes per sample = 960 bytes per frame. */
@@ -12,8 +12,8 @@ const FRAME_SIZE = (TTS_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 480 samples
 const FRAME_BYTE_SIZE = FRAME_SIZE * TTS_CHANNELS * 2; // 960 bytes (16-bit PCM)
 
 export type CheekTtsCallbacks = {
-  /** Called with each encoded Opus frame ready to send over WebSocket. */
-  onOpusFrame: (frame: Buffer) => void;
+  /** Called with each audio frame (Opus or raw PCM) ready to send over WebSocket. */
+  onAudioFrame: (frame: Buffer) => void;
   /** Called when all audio for a sentence has been sent. */
   onSentenceDone: () => void;
   /** Called on error. */
@@ -43,6 +43,7 @@ export function streamTts(opts: {
   text: string;
   config: CheekStreamConfig;
   log: CheekStreamLog;
+  outputFormat?: CheekAudioFormat;
   callbacks: CheekTtsCallbacks;
 }): CheekTtsHandle {
   const provider = opts.config.ttsProvider || "openai";
@@ -54,15 +55,17 @@ export function streamTts(opts: {
 
 /**
  * Streams TTS audio for a single text chunk using OpenAI TTS API.
- * Generates PCM audio, encodes to Opus frames, and delivers via callbacks.
+ * Generates PCM audio, optionally encodes to Opus frames, and delivers via callbacks.
  */
 function streamOpenAiTts(opts: {
   text: string;
   config: CheekStreamConfig;
   log: CheekStreamLog;
+  outputFormat?: CheekAudioFormat;
   callbacks: CheekTtsCallbacks;
 }): CheekTtsHandle {
   const { text, config, log, callbacks } = opts;
+  const outputFormat = opts.outputFormat ?? "opus";
   const abortController = new AbortController();
 
   const apiKey = config.openaiApiKey || process.env.OPENAI_API_KEY;
@@ -79,7 +82,9 @@ function streamOpenAiTts(opts: {
   void (async () => {
     let encoder: OpusScript | null = null;
     try {
-      encoder = createOpusEncoder();
+      if (outputFormat === "opus") {
+        encoder = createOpusEncoder();
+      }
 
       // Request PCM output for streaming — raw 24kHz 16-bit mono PCM
       const response = await openai.audio.speech.create(
@@ -92,7 +97,7 @@ function streamOpenAiTts(opts: {
       );
 
       if (abortController.signal.aborted) {
-        encoder.delete();
+        encoder?.delete();
         return;
       }
 
@@ -100,33 +105,36 @@ function streamOpenAiTts(opts: {
       const arrayBuffer = await response.arrayBuffer();
 
       if (abortController.signal.aborted) {
-        encoder.delete();
+        encoder?.delete();
         return;
       }
 
       const pcmBuffer = Buffer.from(arrayBuffer);
-      let offset = 0;
 
-      while (offset + FRAME_BYTE_SIZE <= pcmBuffer.length) {
-        if (abortController.signal.aborted) break;
-
-        const frame = pcmBuffer.subarray(offset, offset + FRAME_BYTE_SIZE);
-        const opusFrame = encoder.encode(frame, FRAME_SIZE);
-        callbacks.onOpusFrame(Buffer.from(opusFrame));
-        offset += FRAME_BYTE_SIZE;
+      if (outputFormat === "pcm") {
+        // Send raw PCM directly to web clients
+        callbacks.onAudioFrame(pcmBuffer);
+      } else {
+        // Encode to Opus for native clients
+        let offset = 0;
+        while (offset + FRAME_BYTE_SIZE <= pcmBuffer.length) {
+          if (abortController.signal.aborted) break;
+          const frame = pcmBuffer.subarray(offset, offset + FRAME_BYTE_SIZE);
+          const opusFrame = encoder!.encode(frame, FRAME_SIZE);
+          callbacks.onAudioFrame(Buffer.from(opusFrame));
+          offset += FRAME_BYTE_SIZE;
+        }
+        // Encode any remaining partial frame (pad with silence)
+        if (offset < pcmBuffer.length && !abortController.signal.aborted) {
+          const remaining = pcmBuffer.subarray(offset);
+          const padded = Buffer.alloc(FRAME_BYTE_SIZE);
+          remaining.copy(padded);
+          const opusFrame = encoder!.encode(padded, FRAME_SIZE);
+          callbacks.onAudioFrame(Buffer.from(opusFrame));
+        }
+        encoder!.delete();
+        encoder = null;
       }
-
-      // Encode any remaining partial frame (pad with silence)
-      if (offset < pcmBuffer.length && !abortController.signal.aborted) {
-        const remaining = pcmBuffer.subarray(offset);
-        const padded = Buffer.alloc(FRAME_BYTE_SIZE);
-        remaining.copy(padded);
-        const opusFrame = encoder.encode(padded, FRAME_SIZE);
-        callbacks.onOpusFrame(Buffer.from(opusFrame));
-      }
-
-      encoder.delete();
-      encoder = null;
 
       if (!abortController.signal.aborted) {
         callbacks.onSentenceDone();
@@ -150,12 +158,13 @@ function streamOpenAiTts(opts: {
 /**
  * Manages streaming TTS for an entire LLM response.
  * Sentences are queued and processed sequentially to maintain natural ordering.
- * Opus frames are delivered as they're encoded.
+ * Audio frames are delivered as they're produced (Opus or raw PCM).
  */
 export function createTtsPipeline(opts: {
   config: CheekStreamConfig;
   log: CheekStreamLog;
-  onOpusFrame: (frame: Buffer) => void;
+  outputFormat?: CheekAudioFormat;
+  onAudioFrame: (frame: Buffer) => void;
   onComplete: () => void;
   onError: (err: string) => void;
 }): {
@@ -166,7 +175,8 @@ export function createTtsPipeline(opts: {
   /** Abort all pending and in-flight TTS. */
   abort: () => void;
 } {
-  const { config, log, onOpusFrame, onComplete, onError } = opts;
+  const { config, log, onAudioFrame, onComplete, onError } = opts;
+  const outputFormat = opts.outputFormat ?? "opus";
 
   const queue: string[] = [];
   let activeTts: CheekTtsHandle | null = null;
@@ -190,9 +200,10 @@ export function createTtsPipeline(opts: {
       text,
       config,
       log,
+      outputFormat,
       callbacks: {
-        onOpusFrame(frame) {
-          if (!aborted) onOpusFrame(frame);
+        onAudioFrame(frame) {
+          if (!aborted) onAudioFrame(frame);
         },
         onSentenceDone() {
           activeTts = null;
