@@ -5,6 +5,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
 import { createSttStream, type CheekSttStream } from "./cheeko-stt.js";
 import { sendChatMessage, type CheekChatHandle } from "./cheeko-chat.js";
+import { createTtsPipeline } from "./cheeko-tts.js";
 
 export const CHEEKO_STREAM_PATH = "/cheeko/stream";
 
@@ -22,6 +23,8 @@ export type CheekStreamSession = {
   finalTranscript: string;
   /** Active LLM chat handle (for abort support). */
   chatHandle: CheekChatHandle | null;
+  /** Active TTS pipeline (for streaming audio back). */
+  ttsPipeline: ReturnType<typeof createTtsPipeline> | null;
 };
 
 export type CheekStreamLog = {
@@ -167,6 +170,7 @@ export function createCheekStreamHandler(opts: {
       sttStream: null,
       finalTranscript: "",
       chatHandle: null,
+      ttsPipeline: null,
     };
     sessions.set(ws, session);
     log.info(`cheeko: session ${sessionId} started for device ${deviceId}`);
@@ -262,14 +266,47 @@ export function createCheekStreamHandler(opts: {
     sendStatus(session.ws, "thinking");
     const sessionKey = `voice:${session.deviceId}`;
 
+    // Create TTS pipeline to stream audio back to client
+    const config = getConfig();
+    if (config) {
+      session.ttsPipeline = createTtsPipeline({
+        config,
+        log,
+        onOpusFrame(frame) {
+          // Send Opus audio as binary WebSocket frame
+          if (session.ws.readyState === WebSocket.OPEN) {
+            session.ws.send(frame);
+          }
+        },
+        onComplete() {
+          session.ttsPipeline = null;
+          sendJson(session.ws, { type: "audio_end" });
+          session.state = "idle";
+          sendStatus(session.ws, "idle");
+          log.info(`cheeko: session ${session.sessionId} TTS complete`);
+        },
+        onError(err) {
+          session.ttsPipeline = null;
+          sendError(session.ws, `TTS error: ${err}`);
+          session.state = "idle";
+          sendStatus(session.ws, "idle");
+          log.warn(`cheeko: session ${session.sessionId} TTS error: ${err}`);
+        },
+      });
+    }
+
     session.chatHandle = sendChatMessage({
       transcript,
       sessionKey,
       log,
       callbacks: {
         onTextChunk(text) {
-          // Send text chunk to client (for display and future TTS in Task 6)
+          // Send text chunk to client for display
           sendJson(session.ws, { type: "response_text", text, partial: true });
+          // Feed sentence into TTS pipeline for audio streaming
+          if (session.ttsPipeline) {
+            session.ttsPipeline.pushSentence(text);
+          }
         },
         onComplete(fullText) {
           session.chatHandle = null;
@@ -278,14 +315,23 @@ export function createCheekStreamHandler(opts: {
           }
           // Send final text to client
           sendJson(session.ws, { type: "response_text", text: fullText, partial: false });
-          // TTS streaming will be implemented in Task 6
-          // For now, return to idle after LLM completes
-          session.state = "idle";
-          sendStatus(session.ws, "idle");
-          log.info(`cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars)`);
+          // Transition to speaking while TTS finishes streaming audio
+          session.state = "speaking";
+          sendStatus(session.ws, "speaking");
+          log.info(`cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars), streaming TTS`);
+          // Signal TTS that no more sentences will arrive
+          if (session.ttsPipeline) {
+            session.ttsPipeline.finish();
+          } else {
+            // No TTS pipeline — return to idle
+            sendJson(session.ws, { type: "audio_end" });
+            session.state = "idle";
+            sendStatus(session.ws, "idle");
+          }
         },
         onError(err) {
           session.chatHandle = null;
+          abortTts(session);
           sendError(session.ws, `LLM error: ${err}`);
           session.state = "idle";
           sendStatus(session.ws, "idle");
@@ -306,7 +352,7 @@ export function createCheekStreamHandler(opts: {
     log.info(`cheeko: session ${session.sessionId} cancel requested`);
     closeSttStream(session);
     abortChat(session);
-    // Cancel TTS streams (will be implemented in Task 6)
+    abortTts(session);
     session.state = "idle";
     sendStatus(session.ws, "idle");
   }
@@ -318,10 +364,17 @@ export function createCheekStreamHandler(opts: {
     }
   }
 
+  function abortTts(session: CheekStreamSession) {
+    if (session.ttsPipeline) {
+      session.ttsPipeline.abort();
+      session.ttsPipeline = null;
+    }
+  }
+
   function cleanupSession(session: CheekStreamSession) {
     closeSttStream(session);
     abortChat(session);
-    // Clean up TTS resources (will be implemented in Task 6)
+    abortTts(session);
     sessions.delete(session.ws);
   }
 
