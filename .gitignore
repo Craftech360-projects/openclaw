@@ -82,3 +82,5 @@ USER.md
 .agent/*.json
 !.agent/workflows/
 local/
+.cache/npm/_update-notifier-last-checked
+.cache/npm
