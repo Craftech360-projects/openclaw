@@ -21,8 +21,33 @@ function createOpusEncoder(): OpusScript {
 }
 
 /**
+ * Encodes complete PCM frames from a carry buffer and emits them via callback.
+ * Returns any leftover bytes that don't fill a complete frame.
+ */
+function encodeAndEmitFrames(
+  carry: Buffer,
+  chunk: Buffer,
+  encoder: OpusScript,
+  onFrame: (frame: Buffer) => void,
+  abortSignal: AbortSignal,
+): Buffer {
+  const combined = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+  let offset = 0;
+  while (offset + FRAME_BYTE_SIZE <= combined.length) {
+    if (abortSignal.aborted) return Buffer.alloc(0);
+    const frame = combined.subarray(offset, offset + FRAME_BYTE_SIZE);
+    const opusFrame = encoder.encode(frame, FRAME_SIZE);
+    onFrame(Buffer.from(opusFrame));
+    offset += FRAME_BYTE_SIZE;
+  }
+  // Return leftover bytes that don't fill a complete frame
+  return offset < combined.length ? Buffer.from(combined.subarray(offset)) : Buffer.alloc(0);
+}
+
+/**
  * Streams TTS audio for a single text chunk using ElevenLabs API.
- * Requests pcm_24000 output, optionally encodes to Opus, and delivers via callbacks.
+ * Reads the response body as a stream — encodes and sends Opus frames
+ * as PCM chunks arrive, rather than buffering the entire response first.
  */
 export function streamElevenLabsTts(opts: {
   text: string;
@@ -52,7 +77,7 @@ export function streamElevenLabsTts(opts: {
       }
 
       const url = new URL(
-        `${DEFAULT_ELEVENLABS_BASE_URL}/v1/text-to-speech/${voiceId}?output_format=pcm_24000`,
+        `${DEFAULT_ELEVENLABS_BASE_URL}/v1/text-to-speech/${voiceId}/stream?output_format=pcm_24000`,
       );
 
       const response = await fetch(url.toString(), {
@@ -85,33 +110,34 @@ export function streamElevenLabsTts(opts: {
         return;
       }
 
-      const arrayBuffer = await response.arrayBuffer();
-
-      if (abortController.signal.aborted) {
-        encoder?.delete();
-        return;
+      const body = response.body;
+      if (!body) {
+        throw new Error("ElevenLabs response has no readable body");
       }
 
-      const pcmBuffer = Buffer.from(arrayBuffer);
-
       if (outputFormat === "pcm") {
-        // Send raw PCM directly to web clients
-        callbacks.onAudioFrame(pcmBuffer);
-      } else {
-        // Encode to Opus for native clients
-        let offset = 0;
-        while (offset + FRAME_BYTE_SIZE <= pcmBuffer.length) {
+        // Stream raw PCM chunks directly to web clients
+        for await (const chunk of body) {
           if (abortController.signal.aborted) break;
-          const frame = pcmBuffer.subarray(offset, offset + FRAME_BYTE_SIZE);
-          const opusFrame = encoder!.encode(frame, FRAME_SIZE);
-          callbacks.onAudioFrame(Buffer.from(opusFrame));
-          offset += FRAME_BYTE_SIZE;
+          callbacks.onAudioFrame(Buffer.from(chunk));
         }
-        // Encode any remaining partial frame (pad with silence)
-        if (offset < pcmBuffer.length && !abortController.signal.aborted) {
-          const remaining = pcmBuffer.subarray(offset);
+      } else {
+        // Stream PCM chunks, encode to Opus frames, send as they arrive
+        let carry = Buffer.alloc(0);
+        for await (const chunk of body) {
+          if (abortController.signal.aborted) break;
+          carry = encodeAndEmitFrames(
+            carry,
+            Buffer.from(chunk),
+            encoder!,
+            (frame) => callbacks.onAudioFrame(frame),
+            abortController.signal,
+          );
+        }
+        // Flush any remaining partial frame (pad with silence)
+        if (carry.length > 0 && !abortController.signal.aborted) {
           const padded = Buffer.alloc(FRAME_BYTE_SIZE);
-          remaining.copy(padded);
+          carry.copy(padded);
           const opusFrame = encoder!.encode(padded, FRAME_SIZE);
           callbacks.onAudioFrame(Buffer.from(opusFrame));
         }

@@ -17,6 +17,7 @@ import { createSessionsListTool } from "./tools/sessions-list-tool.js";
 import { createSessionsSendTool } from "./tools/sessions-send-tool.js";
 import { createSessionsSpawnTool } from "./tools/sessions-spawn-tool.js";
 import { createTtsTool } from "./tools/tts-tool.js";
+import { createMusicTool } from "./tools/music-tool.js";
 import { createWebFetchTool, createWebSearchTool } from "./tools/web-tools.js";
 
 export function createOpenClawTools(options?: {
@@ -105,6 +106,9 @@ export function createOpenClawTools(options?: {
     createTtsTool({
       agentChannel: options?.agentChannel,
       config: options?.config,
+    }),
+    createMusicTool({
+      agentSessionKey: options?.agentSessionKey,
     }),
     createGatewayTool({
       agentSessionKey: options?.agentSessionKey,

@@ -19,6 +19,7 @@
   .status-stt { background: rgba(160,120,255,0.15); color: #a078ff; }
   .status-thinking { background: rgba(255,200,50,0.15); color: #ffc832; }
   .status-speaking { background: rgba(200,80,255,0.15); color: #c850ff; }
+  .status-music { background: rgba(255,140,50,0.15); color: #ff8c32; }
   .status-error { background: rgba(255,80,80,0.15); color: #ff5050; }
   .transcript-area { width: min(640px, 100%); flex: 1; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 14px 16px; overflow-y: auto; min-height: 200px; max-height: 60vh; margin-bottom: 16px; }
   .msg { margin-bottom: 10px; animation: fadeIn 0.15s ease; }
@@ -316,6 +317,15 @@
         break;
       case "audio_end":
         // TTS finished
+        break;
+      case "music_start":
+        setStatus("music", "Playing: " + (msg.query || "Music"));
+        break;
+      case "music_end":
+        stopPlayback();
+        if (currentState === "music") {
+          setStatus("idle", "Ready");
+        }
         break;
       case "latency":
         if (msg.speechEndToFirstAudio) {

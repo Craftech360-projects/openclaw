@@ -6,6 +6,15 @@ import type { CheekStreamConfig } from "../config/types.gateway.js";
 import { createSttStream, type CheekSttStream } from "./cheeko-stt.js";
 import { sendChatMessage, type CheekChatHandle } from "./cheeko-chat.js";
 import { createTtsPipeline } from "./cheeko-tts.js";
+import { streamMusic, type MusicHandle } from "./cheeko-music.js";
+import {
+  onMusicPlay,
+  onMusicStop,
+  offMusicPlay,
+  offMusicStop,
+  type MusicPlayEvent,
+  type MusicStopEvent,
+} from "./cheeko-music-events.js";
 
 export const CHEEKO_STREAM_PATH = "/cheeko/stream";
 
@@ -34,6 +43,10 @@ export type CheekStreamSession = {
   speechEndAt: number;
   /** Whether the first audio frame for the current response has been sent. */
   firstAudioSent: boolean;
+  /** Active music streaming handle (for abort support). */
+  musicHandle: MusicHandle | null;
+  /** Pending music query — will start after TTS completes. */
+  pendingMusicQuery: string | null;
 };
 
 export type CheekStreamLog = {
@@ -81,6 +94,76 @@ export function createCheekStreamHandler(opts: {
   const sessions = new Map<WebSocket, CheekStreamSession>();
 
   const wss = new WebSocketServer({ noServer: true });
+
+  // --- Music event bridge listeners ---
+
+  function findSessionByKey(sessionKey: string): CheekStreamSession | undefined {
+    for (const session of sessions.values()) {
+      // Match both raw key (voice:deviceId) and canonical key (agent:main:voice:deviceId)
+      const voiceKey = `voice:${session.deviceId}`;
+      if (sessionKey === voiceKey || sessionKey.endsWith(`:${voiceKey}`)) {
+        return session;
+      }
+    }
+    return undefined;
+  }
+
+  function handleMusicPlayEvent(event: MusicPlayEvent) {
+    const session = findSessionByKey(event.sessionKey);
+    if (!session) return;
+    // Queue the music request — it will start after TTS completes
+    session.pendingMusicQuery = event.query;
+    log.info(`cheeko: session ${session.sessionId} music queued: "${event.query}"`);
+  }
+
+  function handleMusicStopEvent(event: MusicStopEvent) {
+    const session = findSessionByKey(event.sessionKey);
+    if (!session) return;
+    session.pendingMusicQuery = null;
+    if (session.musicHandle) {
+      abortMusic(session);
+      sendJson(session.ws, { type: "music_end" });
+      session.state = "idle";
+      sendStatus(session.ws, "idle");
+      log.info(`cheeko: session ${session.sessionId} music stopped by agent`);
+    }
+  }
+
+  onMusicPlay(handleMusicPlayEvent);
+  onMusicStop(handleMusicStopEvent);
+
+  function startMusicForSession(session: CheekStreamSession, query: string) {
+    abortMusic(session); // Stop any existing music first
+    session.pendingMusicQuery = null;
+
+    sendJson(session.ws, { type: "music_start", query });
+    log.info(`cheeko: session ${session.sessionId} starting music: "${query}"`);
+
+    session.musicHandle = streamMusic({
+      query,
+      outputFormat: session.audioFormat,
+      log,
+      onAudioFrame(frame) {
+        if (session.ws.readyState === WebSocket.OPEN) {
+          session.ws.send(frame);
+        }
+      },
+      onComplete() {
+        session.musicHandle = null;
+        sendJson(session.ws, { type: "music_end" });
+        session.state = "idle";
+        sendStatus(session.ws, "idle");
+        log.info(`cheeko: session ${session.sessionId} music complete`);
+      },
+      onError(msg) {
+        session.musicHandle = null;
+        sendJson(session.ws, { type: "music_end" });
+        session.state = "idle";
+        sendStatus(session.ws, "idle");
+        log.warn(`cheeko: session ${session.sessionId} music error: ${msg}`);
+      },
+    });
+  }
 
   const HANDSHAKE_TIMEOUT_MS = 10_000;
 
@@ -184,6 +267,8 @@ export function createCheekStreamHandler(opts: {
       ttsPipeline: null,
       speechEndAt: 0,
       firstAudioSent: false,
+      musicHandle: null,
+      pendingMusicQuery: null,
     };
     sessions.set(ws, session);
     log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat})`);
@@ -233,7 +318,14 @@ export function createCheekStreamHandler(opts: {
   }
 
   function handleAudioChunk(session: CheekStreamSession, data: Buffer) {
-    if (session.state === "idle") {
+    // If music is playing, stop it when the user starts talking
+    const wasPlayingMusic = session.musicHandle !== null;
+    if (wasPlayingMusic) {
+      abortMusic(session);
+      sendJson(session.ws, { type: "music_end" });
+    }
+
+    if (session.state === "idle" || wasPlayingMusic) {
       session.state = "listening";
       sendStatus(session.ws, "listening");
     }
@@ -316,9 +408,16 @@ export function createCheekStreamHandler(opts: {
         onComplete() {
           session.ttsPipeline = null;
           sendJson(session.ws, { type: "audio_end" });
-          session.state = "idle";
-          sendStatus(session.ws, "idle");
           log.info(`cheeko: session ${session.sessionId} TTS complete`);
+
+          // If music was queued by the LLM, start it now
+          if (session.pendingMusicQuery) {
+            const query = session.pendingMusicQuery;
+            startMusicForSession(session, query);
+          } else {
+            session.state = "idle";
+            sendStatus(session.ws, "idle");
+          }
         },
         onError(err) {
           session.ttsPipeline = null;
@@ -388,6 +487,8 @@ export function createCheekStreamHandler(opts: {
     closeSttStream(session);
     abortChat(session);
     abortTts(session);
+    abortMusic(session);
+    session.pendingMusicQuery = null;
     session.state = "idle";
     sendStatus(session.ws, "idle");
   }
@@ -406,10 +507,19 @@ export function createCheekStreamHandler(opts: {
     }
   }
 
+  function abortMusic(session: CheekStreamSession) {
+    if (session.musicHandle) {
+      session.musicHandle.abort();
+      session.musicHandle = null;
+    }
+  }
+
   function cleanupSession(session: CheekStreamSession) {
     closeSttStream(session);
     abortChat(session);
     abortTts(session);
+    abortMusic(session);
+    session.pendingMusicQuery = null;
     sessions.delete(session.ws);
   }
 
@@ -436,6 +546,8 @@ export function createCheekStreamHandler(opts: {
   }
 
   function close() {
+    offMusicPlay(handleMusicPlayEvent);
+    offMusicStop(handleMusicStopEvent);
     for (const [ws, session] of sessions) {
       cleanupSession(session);
       ws.close(1001, "server shutting down");

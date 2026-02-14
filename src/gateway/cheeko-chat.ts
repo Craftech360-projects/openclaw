@@ -134,7 +134,7 @@ export function sendChatMessage(opts: {
   // Instruct the agent to reply with plain text only — audio synthesis is handled
   // externally by the cheeko voice pipeline (STT → LLM → TTS).
   const voicePrefix =
-    "[Voice conversation — respond with plain text only. Do NOT use the tts tool. Audio is handled by the voice pipeline.]\n";
+    "[Voice conversation — respond with plain text only. Do NOT use the tts tool. Audio is handled by the voice pipeline. IMPORTANT: Always include a spoken text response even when calling tools (e.g. say \"Sure, playing Baby Shark!\" before calling the music tool). Never respond with only a tool call and no text.]\n";
 
   const ctx: MsgContext = {
     Body: transcript,
