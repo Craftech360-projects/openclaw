@@ -175,6 +175,33 @@ export class CheekTestClient {
     return this.waitForMessage((m) => m.type === "hello_ack");
   }
 
+  /** Send ESP32-format hello and wait for ESP32-format hello response. */
+  async sendEsp32Hello(): Promise<CheekJsonMessage> {
+    this._send(JSON.stringify({
+      type: "hello",
+      version: 1,
+      transport: "websocket",
+      audio_params: { format: "opus", sample_rate: 16000, channels: 1, frame_duration: 20 },
+      features: {},
+    }));
+    return this.waitForMessage((m) => m.type === "hello" && m.transport === "websocket");
+  }
+
+  /** Send ESP32 listen:start message. */
+  sendListenStart(sessionId: string, mode = "manual"): void {
+    this._send(JSON.stringify({ session_id: sessionId, type: "listen", state: "start", mode }));
+  }
+
+  /** Send ESP32 listen:stop message. */
+  sendListenStop(sessionId: string): void {
+    this._send(JSON.stringify({ session_id: sessionId, type: "listen", state: "stop" }));
+  }
+
+  /** Send ESP32 abort message. */
+  sendAbort(sessionId: string, reason = "user_cancel"): void {
+    this._send(JSON.stringify({ session_id: sessionId, type: "abort", reason }));
+  }
+
   /** Send a binary audio frame. */
   sendAudio(frame: Buffer): void {
     this._send(frame);
