@@ -291,15 +291,33 @@ export function createCheekStreamHandler(opts: {
     }
   }
 
+  function stripEsp32BinaryHeader(data: Buffer, version: number): Buffer {
+    if (version === 2 && data.length > 16) {
+      // v2: 16-byte header (uint16 version + uint16 type + uint32 reserved + uint32 timestamp + uint32 payload_size)
+      return data.subarray(16);
+    }
+    if (version === 3 && data.length > 4) {
+      // v3: 4-byte header (uint8 type + uint8 reserved + uint16 payload_size)
+      return data.subarray(4);
+    }
+    // v1: raw Opus passthrough
+    return data;
+  }
+
   function handleAudioChunk(session: CheekStreamSession, data: Buffer) {
     if (session.state === "idle") {
       session.state = "listening";
       sendStatus(session.ws, "listening");
     }
 
+    let audioData = data;
+    if (session.isEsp32Client && session.protocolVersion >= 2) {
+      audioData = stripEsp32BinaryHeader(data, session.protocolVersion);
+    }
+
     const stt = ensureSttStream(session);
     if (stt) {
-      stt.sendAudio(data);
+      stt.sendAudio(audioData);
     }
   }
 
