@@ -78,6 +78,11 @@ function sendStatus(ws: WebSocket, stage: string) {
   sendJson(ws, { type: "status", stage });
 }
 
+/** Send JSON to an ESP32 client, automatically including session_id. */
+function sendEsp32Json(session: CheekStreamSession, payload: Record<string, unknown>) {
+  sendJson(session.ws, { session_id: session.sessionId, ...payload });
+}
+
 export function createCheekStreamHandler(opts: {
   getConfig: () => CheekStreamConfig | undefined;
   log: CheekStreamLog;
@@ -271,7 +276,11 @@ export function createCheekStreamHandler(opts: {
         log,
         audioFormat: session.audioFormat,
         onTranscript(text, isFinal) {
-          sendJson(session.ws, { type: "transcript", text, partial: !isFinal });
+          if (session.isEsp32Client) {
+            if (isFinal) sendEsp32Json(session, { type: "stt", text });
+          } else {
+            sendJson(session.ws, { type: "transcript", text, partial: !isFinal });
+          }
           if (isFinal) {
             session.finalTranscript += (session.finalTranscript ? " " : "") + text;
             log.info(`cheeko-stt: final segment: "${text}"`);
@@ -392,9 +401,13 @@ export function createCheekStreamHandler(opts: {
         onAudioFrame,
         onComplete() {
           session.ttsPipeline = null;
-          sendJson(session.ws, { type: "audio_end" });
+          if (session.isEsp32Client) {
+            sendEsp32Json(session, { type: "tts", state: "stop" });
+          } else {
+            sendJson(session.ws, { type: "audio_end" });
+            sendStatus(session.ws, "idle");
+          }
           session.state = "idle";
-          sendStatus(session.ws, "idle");
           log.info(`cheeko: session ${session.sessionId} TTS complete`);
         },
         onError(err) {
@@ -414,7 +427,11 @@ export function createCheekStreamHandler(opts: {
       callbacks: {
         onTextChunk(text) {
           // Send text chunk to client for display
-          sendJson(session.ws, { type: "response_text", text, partial: true });
+          if (session.isEsp32Client) {
+            sendEsp32Json(session, { type: "tts", state: "sentence_start", text });
+          } else {
+            sendJson(session.ws, { type: "response_text", text, partial: true });
+          }
           // Feed sentence into TTS pipeline for audio streaming
           if (session.ttsPipeline) {
             session.ttsPipeline.pushSentence(text);
@@ -426,19 +443,29 @@ export function createCheekStreamHandler(opts: {
             session.chatHistory.push({ role: "assistant", content: fullText });
           }
           // Send final text to client
-          sendJson(session.ws, { type: "response_text", text: fullText, partial: false });
+          if (!session.isEsp32Client) {
+            sendJson(session.ws, { type: "response_text", text: fullText, partial: false });
+          }
           // Transition to speaking while TTS finishes streaming audio
           session.state = "speaking";
-          sendStatus(session.ws, "speaking");
+          if (session.isEsp32Client) {
+            sendEsp32Json(session, { type: "tts", state: "start" });
+          } else {
+            sendStatus(session.ws, "speaking");
+          }
           log.info(`cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars), streaming TTS`);
           // Signal TTS that no more sentences will arrive
           if (session.ttsPipeline) {
             session.ttsPipeline.finish();
           } else {
             // No TTS pipeline — return to idle
-            sendJson(session.ws, { type: "audio_end" });
+            if (session.isEsp32Client) {
+              sendEsp32Json(session, { type: "tts", state: "stop" });
+            } else {
+              sendJson(session.ws, { type: "audio_end" });
+              sendStatus(session.ws, "idle");
+            }
             session.state = "idle";
-            sendStatus(session.ws, "idle");
           }
         },
         onError(err) {
