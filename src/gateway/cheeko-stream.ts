@@ -49,7 +49,8 @@ export type CheekStreamLog = {
 };
 
 type ControlMessage =
-  | { type: "hello"; deviceId?: string; token?: string; clientType?: string }
+  | { type: "hello"; deviceId?: string; token?: string; clientType?: string;
+      transport?: string; audio_params?: Record<string, unknown>; version?: number; features?: Record<string, unknown> }
   | { type: "speech_end" }
   | { type: "cancel" };
 
@@ -90,7 +91,7 @@ export function createCheekStreamHandler(opts: {
 
   const HANDSHAKE_TIMEOUT_MS = 10_000;
 
-  wss.on("connection", (ws: WebSocket) => {
+  wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     log.info("cheeko: new WebSocket connection");
 
     // Require hello handshake within timeout
@@ -130,7 +131,7 @@ export function createCheekStreamHandler(opts: {
           return;
         }
         clearTimeout(handshakeTimer);
-        handleHello(ws, msg);
+        handleHello(ws, msg, req);
         return;
       }
 
@@ -165,7 +166,11 @@ export function createCheekStreamHandler(opts: {
     });
   });
 
-  function handleHello(ws: WebSocket, msg: { type: "hello"; deviceId?: string; token?: string; clientType?: string }) {
+  function handleHello(
+    ws: WebSocket,
+    msg: ControlMessage & { type: "hello" },
+    req: IncomingMessage,
+  ) {
     const config = getConfig();
     if (!config?.enabled) {
       sendError(ws, "cheeko stream endpoint is disabled");
@@ -173,8 +178,16 @@ export function createCheekStreamHandler(opts: {
       return;
     }
 
-    const deviceId = msg.deviceId || `device-${randomUUID().slice(0, 8)}`;
+    // Detect ESP32 clients by checking for fields that only ESP32 firmware sends
+    const isEsp32 = msg.transport === "websocket" || msg.audio_params != null || typeof msg.version === "number";
+
+    const deviceId = isEsp32
+      ? (req.headers["device-id"] as string || `esp32-${randomUUID().slice(0, 8)}`)
+      : (msg.deviceId || `device-${randomUUID().slice(0, 8)}`);
     const audioFormat: CheekAudioFormat = msg.clientType === "web" ? "pcm" : "opus";
+    const protocolVersion = isEsp32
+      ? ((msg.version ?? Number(req.headers["protocol-version"])) || 1)
+      : 1;
     const sessionId = randomUUID();
     const session: CheekStreamSession = {
       sessionId,
@@ -190,18 +203,35 @@ export function createCheekStreamHandler(opts: {
       ttsPipeline: null,
       speechEndAt: 0,
       firstAudioSent: false,
-      isEsp32Client: false,
-      protocolVersion: 1,
+      isEsp32Client: isEsp32,
+      protocolVersion,
       esp32ListeningMode: "manual",
     };
     sessions.set(ws, session);
-    log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat})`);
-    sendJson(ws, {
-      type: "hello_ack",
-      sessionId,
-      deviceId,
-    });
-    sendStatus(ws, "idle");
+    log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat}, esp32: ${isEsp32}, proto: ${protocolVersion})`);
+
+    if (isEsp32) {
+      // Respond in the format ESP32 firmware expects
+      sendJson(ws, {
+        type: "hello",
+        transport: "websocket",
+        session_id: sessionId,
+        audio_params: {
+          format: "opus",
+          sample_rate: 24000,
+          channels: 1,
+          frame_duration: 20,
+        },
+      });
+      // ESP32 does not expect status:idle after hello
+    } else {
+      sendJson(ws, {
+        type: "hello_ack",
+        sessionId,
+        deviceId,
+      });
+      sendStatus(ws, "idle");
+    }
   }
 
   function ensureSttStream(session: CheekStreamSession): CheekSttStream | null {
