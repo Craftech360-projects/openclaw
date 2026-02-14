@@ -52,7 +52,9 @@ type ControlMessage =
   | { type: "hello"; deviceId?: string; token?: string; clientType?: string;
       transport?: string; audio_params?: Record<string, unknown>; version?: number; features?: Record<string, unknown> }
   | { type: "speech_end" }
-  | { type: "cancel" };
+  | { type: "cancel" }
+  | { type: "listen"; state: string; mode?: string }
+  | { type: "abort"; reason?: string };
 
 function tryParseJson(data: string): unknown {
   try {
@@ -146,6 +148,24 @@ export function createCheekStreamHandler(opts: {
           break;
         case "cancel":
           handleCancel(session);
+          break;
+        case "listen":
+          if (session.isEsp32Client) {
+            if (msg.state === "start") {
+              session.esp32ListeningMode = msg.mode || "manual";
+            } else if (msg.state === "stop") {
+              handleSpeechEnd(session);
+            }
+          } else {
+            sendError(ws, `unknown message type: listen`);
+          }
+          break;
+        case "abort":
+          if (session.isEsp32Client) {
+            handleCancel(session);
+          } else {
+            sendError(ws, `unknown message type: abort`);
+          }
           break;
         default:
           sendError(ws, `unknown message type: ${(msg as Record<string, unknown>).type}`);
