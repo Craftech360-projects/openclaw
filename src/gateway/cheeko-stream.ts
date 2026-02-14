@@ -34,6 +34,12 @@ export type CheekStreamSession = {
   speechEndAt: number;
   /** Whether the first audio frame for the current response has been sent. */
   firstAudioSent: boolean;
+  /** Whether this client is an ESP32 device (detected from hello message format). */
+  isEsp32Client: boolean;
+  /** ESP32 binary protocol version: 1 (raw Opus), 2, or 3. */
+  protocolVersion: number;
+  /** ESP32 listening mode: "auto" | "manual" | "realtime". */
+  esp32ListeningMode: string;
 };
 
 export type CheekStreamLog = {
@@ -184,6 +190,9 @@ export function createCheekStreamHandler(opts: {
       ttsPipeline: null,
       speechEndAt: 0,
       firstAudioSent: false,
+      isEsp32Client: false,
+      protocolVersion: 1,
+      esp32ListeningMode: "manual",
     };
     sessions.set(ws, session);
     log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat})`);

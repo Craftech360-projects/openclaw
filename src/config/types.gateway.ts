@@ -232,6 +232,8 @@ export type CheekStreamConfig = {
   elevenlabsVoiceId?: string;
   /** ElevenLabs model ID (default: eleven_turbo_v2). */
   elevenlabsModelId?: string;
+  /** Static token for ESP32 device authentication (default: "cheeko-esp32-token"). */
+  esp32Token?: string;
 };
 
 export type GatewayConfig = {
