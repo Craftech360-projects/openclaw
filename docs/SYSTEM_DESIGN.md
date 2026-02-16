@@ -11,7 +11,7 @@
 
 1. [Overview](#1-overview)
 2. [High-Level Architecture](#2-high-level-architecture)
-3. [Core Components](#3-core-components)
+3. [Core Components](#3-core-components) (Gateway, CLI, Build System, **Node System**)
 4. [Voice Pipeline (Cheeko)](#4-voice-pipeline-cheeko)
 5. [Multi-Channel Messaging](#5-multi-channel-messaging)
 6. [Agent & LLM Orchestration](#6-agent--llm-orchestration)
@@ -151,13 +151,15 @@ graph TD
     end
 
     subgraph Clients
-        WEBCLI[Web UI Client]
-        CLICLI[CLI Client]
-        MOBCLI[Mobile App Client]
+        WEBCLI["Web UI Client<br/>role: operator"]
+        CLICLI["CLI Client<br/>role: operator"]
+        MOBCLI["Mobile App<br/>role: operator | node"]
         BOTCLI[Channel Bots]
+        NODECLI["Node Devices<br/>role: node"]
     end
 
     Clients -->|WS + Token| WSS
+    NODECLI -->|WS + Pairing| WSS
     Clients -->|REST| HTTPS
     WSS --> AUTH --> EVT
     HTTPS --> AUTH
@@ -171,6 +173,14 @@ graph TD
 - **Client modes:** `BACKEND`, `EMBEDDED`, `WEB_UI`
 - **Authentication:** Token-based with device identity signing + TLS fingerprint validation
 
+**Connection types on port 18789:**
+
+| Endpoint | Role | Auth | Purpose |
+|----------|------|------|---------|
+| Gateway WebSocket | `operator` | Token (`gateway.auth.token`) | CLI, web UI, messaging channels |
+| Gateway WebSocket | `node` | Token + device pairing | Companion devices exposing capabilities (see [3.4](#34-node-system)) |
+| `/cheeko/stream` | *(none)* | None (endpoint enable/disable) | Voice pipeline — separate WebSocket, own session management |
+
 **Entry points:**
 
 | File | Purpose |
@@ -182,24 +192,193 @@ graph TD
 
 ### 3.2 CLI Interface
 
-OpenClaw provides a comprehensive CLI built with Commander.js:
+OpenClaw provides a comprehensive CLI built with Commander.js. Each command maps to a dedicated system described in the referenced section.
 
 ```
 openclaw
-├── gateway         # Start/manage the gateway
-├── onboard         # First-time setup wizard
-├── agent           # Run agent commands
-├── channels        # Channel management & status
-├── config          # Configuration management
-├── doctor          # Diagnostic checks
-├── cron            # Scheduled task management
-├── plugins         # Plugin management
-├── nodes           # Node device management
-├── message         # Send messages programmatically
-├── logs            # View structured logs
-├── dashboard       # Terminal dashboard
-└── update          # Update to stable/beta/dev channel
+├── gateway         # Start/manage the gateway          → Section 3.1
+├── onboard         # First-time setup wizard            → below
+├── agent           # Run agent commands                 → Section 6
+├── channels        # Channel management & status        → Section 5
+├── config          # Configuration management           → Section 8
+├── doctor          # Diagnostic checks                  → below
+├── cron            # Scheduled task management           → below
+├── plugins         # Plugin management                  → Section 7
+├── nodes           # Node device management             → Section 3.4
+├── message         # Send messages programmatically     → below
+├── logs            # View structured logs               → below
+├── dashboard       # Terminal dashboard                 → below
+└── update          # Update to stable/beta/dev channel  → below
 ```
+
+#### `openclaw onboard` — First-Time Setup Wizard
+
+Interactive setup wizard that configures the gateway, workspace, authentication, channels, and skills.
+
+| Flag | Description |
+|------|-------------|
+| `--flow quickstart` | Minimal prompts, auto-generates gateway token |
+| `--flow advanced` | Full prompts for port, bind, auth |
+| `--mode remote` | Remote gateway setup |
+| `--reset` | Reset configuration during onboarding |
+| `--non-interactive` | No prompts (requires `--accept-risk`) |
+| `--auth-choice <provider>` | Auth provider: `anthropic`, `openai`, `google`, etc. |
+
+**File:** `src/commands/onboard.ts`
+
+#### `openclaw doctor` — Diagnostic Checks & Repair
+
+Runs health checks across the system and optionally auto-repairs issues.
+
+**Checks performed:**
+- Config migrations & deprecated env vars
+- Auth profiles (OAuth, Anthropic, deprecated profiles)
+- Gateway daemon status and health
+- Sandbox images and state
+- Security warnings
+- Shell completion setup
+- Model catalog validation
+- Platform-specific issues (macOS launchctl, systemd linger)
+
+| Flag | Description |
+|------|-------------|
+| `--fix` / `--repair` | Write fixes to config |
+| `--deep` | Extra checks |
+| `--non-interactive` | No prompts |
+| `--generate-gateway-token` | Auto-create gateway token |
+
+Creates backup at `~/.openclaw/openclaw.json.bak` before any repair.
+
+**File:** `src/commands/doctor.ts`
+
+#### `openclaw cron` — Scheduled Task Management
+
+Manage recurring and one-shot jobs via the gateway scheduler.
+
+| Subcommand | Description |
+|------------|-------------|
+| `cron status` | Show scheduler status |
+| `cron list [--all]` | List jobs (include disabled with `--all`) |
+| `cron add --name <name>` | Create a new job |
+| `cron edit <job-id>` | Edit existing job |
+| `cron delete <job-id>` | Delete a job |
+| `cron disable/enable <job-id>` | Toggle job |
+
+**Scheduling options:**
+
+| Flag | Example | Description |
+|------|---------|-------------|
+| `--at <when>` | `--at +20m`, `--at 2026-03-01T09:00` | Run once at time or offset |
+| `--every <dur>` | `--every 1h` | Recurring interval |
+| `--cron <expr>` | `--cron "0 9 * * 1"` | 5-field cron expression |
+| `--tz <iana>` | `--tz America/New_York` | Timezone |
+
+**Payload options:** `--message <text>`, `--system-event <text>`, `--channel <id>`, `--announce`, `--delete-after-run`
+
+```typescript
+type CronJob = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  schedule: CronSchedule;    // "at" | "every" | "cron"
+  sessionTarget?: "main" | "isolated";
+  agentId?: string;
+  state: {
+    nextRunAtMs?: number;
+    lastRunAtMs?: number;
+    lastStatus?: "ok" | "error" | "skipped";
+  };
+};
+```
+
+**Files:** `src/cli/cron-cli/register.ts`, `register.cron-add.ts`
+
+#### `openclaw message` — Send Messages Programmatically
+
+Unified CLI for sending messages and performing channel actions across 9+ platforms.
+
+| Action | Description |
+|--------|-------------|
+| `send` | Send a message (`--media`, `--reply-to`, `--buttons`) |
+| `poll` | Create a poll (`--poll-question`, `--poll-option`) |
+| `react` | Add/remove reactions (`--emoji`) |
+| `read` | Read messages (`--limit`, `--before`, `--after`) |
+| `edit` / `delete` | Modify/remove messages |
+| `pin` / `unpin` | Pin management |
+| `search` | Search messages |
+| `broadcast` | Send to all channels |
+| `thread create/list/reply` | Thread management (Discord) |
+| `emoji list/upload` | Custom emoji (Discord) |
+
+**Common flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--channel <name>` | Target platform (whatsapp, telegram, discord, slack, etc.) |
+| `--target <dest>` | Chat/user identifier (format varies by platform) |
+| `--message <text>` | Message content |
+| `--json` | JSON output |
+| `--dry-run` | Test without sending |
+
+**File:** `src/commands/message.ts`
+
+#### `openclaw logs` — View Structured Logs
+
+Tail gateway logs over RPC. Works locally and remotely (no SSH required).
+
+| Flag | Description |
+|------|-------------|
+| `--follow` | Tail mode (like `tail -f`) |
+| `--limit <n>` | Max lines (default: 200) |
+| `--json` | JSON output (one log object per line) |
+| `--plain` / `--no-color` | Disable ANSI colors |
+| `--local-time` | Display timestamps in local timezone |
+| `--interval <ms>` | Polling interval (default: 1000) |
+
+**Output fields:** time, level, subsystem, module, message
+
+**File:** `src/cli/logs-cli.ts`
+
+#### `openclaw dashboard` — Open Control UI
+
+Opens the web-based Control UI in the default browser with embedded auth.
+
+| Flag | Description |
+|------|-------------|
+| `--no-open` | Print URL only, don't launch browser |
+
+Embeds the gateway auth token in the URL fragment (not query params, for security). Copies URL to clipboard. Shows SSH tunnel hint if no browser is available.
+
+**File:** `src/commands/dashboard.ts`
+
+#### `openclaw update` — Update & Channel Management
+
+Safely update OpenClaw and switch release channels.
+
+| Subcommand | Description |
+|------------|-------------|
+| `update` | Update to latest on current channel |
+| `update status` | Show active channel, version, availability |
+| `update wizard` | Interactive channel picker with restart |
+
+| Flag | Description |
+|------|-------------|
+| `--channel <stable\|beta\|dev>` | Switch release channel (persisted) |
+| `--tag <version>` | Override for one-time update |
+| `--no-restart` | Skip gateway restart after update |
+| `--json` | JSON output |
+
+**Update steps:**
+1. Clean worktree check
+2. Fetch upstream (dev: git, stable/beta: npm)
+3. Preflight build (dev only)
+4. Install dependencies
+5. Build project + UI
+6. Run `openclaw doctor` validation
+7. Sync plugins
+8. Restart gateway
+
+**File:** `src/cli/update-cli.ts`
 
 ### 3.3 Build System
 
@@ -220,6 +399,159 @@ graph LR
 | `oxfmt` | Rust-based formatter |
 | `vitest` | Test runner with V8 coverage |
 | `vite` | React UI bundler |
+
+### 3.4 Node System
+
+Nodes are **companion devices** that connect to the OpenClaw Gateway and expose device-level capabilities (camera, screen, system commands, etc.) via RPC. Nodes are peripherals — they don't run the gateway themselves.
+
+**Examples of nodes:**
+- iOS/Android companion app
+- macOS menubar app (in node mode)
+- Headless Linux/Windows host
+
+```mermaid
+graph TD
+    subgraph Gateway["OpenClaw Gateway"]
+        NR[Node Registry]
+        NCP[Node Command Policy]
+        NEV[Node Event Handler]
+    end
+
+    subgraph Nodes["Connected Nodes"]
+        IOS["iOS App<br/>role: node"]
+        MAC["macOS App<br/>role: node"]
+        HEADLESS["Headless Host<br/>role: node"]
+    end
+
+    IOS -->|WS connect<br/>role: node| NR
+    MAC -->|WS connect<br/>role: node| NR
+    HEADLESS -->|WS connect<br/>role: node| NR
+
+    NR -->|node.invoke| IOS
+    NR -->|node.invoke| MAC
+    NR -->|node.invoke| HEADLESS
+
+    IOS -->|node.event| NEV
+    MAC -->|node.event| NEV
+    HEADLESS -->|node.event| NEV
+```
+
+#### Node Session
+
+Each connected node is tracked as a `NodeSession`:
+
+```typescript
+type NodeSession = {
+  nodeId: string;           // Unique device identifier
+  connId: string;           // WebSocket connection ID
+  displayName: string;
+  platform: string;         // "ios", "macos", "android", "linux", "windows"
+  version: string;
+  deviceFamily: string;
+  modelIdentifier: string;
+  caps: string[];           // Capability list
+  commands: string[];       // Available commands
+  permissions: Record<string, boolean>;  // e.g. screenRecording, accessibility
+  connectedAtMs: number;
+};
+```
+
+#### Node Commands by Platform
+
+Nodes expose different command sets depending on platform:
+
+| Category | Commands | Platform |
+|----------|----------|----------|
+| **Canvas** | `canvas.present`, `canvas.hide`, `canvas.navigate`, `canvas.eval`, `canvas.snapshot` | All |
+| **Camera** | `camera.list`, `camera.snap`, `camera.clip` | All |
+| **Location** | `location.get` | All |
+| **Device** | `device.info`, `device.status` | All |
+| **System** | `system.run`, `system.which`, `system.notify` | macOS, Linux, Windows |
+| **Contacts** | `contacts.search`, `contacts.add` | iOS, Android |
+| **Calendar** | `calendar.events`, `calendar.add` | iOS, Android |
+| **Reminders** | `reminders.list`, `reminders.add` | iOS, Android |
+| **Photos** | `photos.latest` | iOS, Android |
+| **SMS** | `sms.send` | Android only |
+| **Screen** | `screen.record` | macOS, iOS |
+
+#### Node Invocation Protocol
+
+The gateway invokes commands on nodes via RPC:
+
+```typescript
+// Gateway → Node
+node.invoke({
+  nodeId: string;
+  command: string;       // e.g. "camera.snap", "system.run"
+  params?: unknown;
+  timeoutMs?: number;
+}) => {
+  ok: boolean;
+  payload?: unknown;
+  error?: { code?: string; message?: string };
+}
+```
+
+Nodes send events back to the gateway:
+
+```typescript
+// Node → Gateway
+node.event({
+  type: "voice.transcript"    // Voice input from node
+      | "agent.request"       // Agent deeplink invocation
+      | "exec.started"        // Command execution started
+      | "exec.finished"       // Command execution finished
+      | "exec.denied";        // Command execution denied
+  data: unknown;
+})
+```
+
+#### Pairing & Security
+
+Nodes follow a device pairing model for security:
+
+```mermaid
+sequenceDiagram
+    participant Node as Node Device
+    participant GW as Gateway
+    participant User as User (CLI)
+
+    Node->>GW: WS connect (role: "node")
+    GW-->>Node: Pairing request created
+    GW-->>User: "New device wants to pair"
+    User->>GW: openclaw devices approve <requestId>
+    GW-->>Node: Pairing approved
+    Note over Node,GW: Node can now send/receive commands
+```
+
+**Command security:**
+- Allowlists configured via `gateway.nodes.allowCommands` / `denyCommands`
+- "Dangerous" commands (`camera.snap`, `screen.record`, `sms.send`) are disabled by default
+- Per-node exec approvals stored at `~/.openclaw/exec-approvals.json`
+
+#### Node vs Voice Pipeline
+
+Nodes and the voice pipeline (Cheeko) serve different purposes:
+
+| | Node | Voice (Cheeko) |
+|---|---|---|
+| **Direction** | Gateway invokes commands **on the device** | Device sends audio **to the gateway** |
+| **Purpose** | Expose device capabilities to the AI | Consume AI capabilities (STT/LLM/TTS) |
+| **Protocol** | RPC (`node.invoke` → response) | Streaming (continuous binary audio) |
+| **Connection** | Gateway WebSocket with `role: "node"` | `/cheeko/stream` (separate endpoint, no role) |
+| **Auth** | Device pairing + token | None (endpoint enable/disable only) |
+
+#### Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/gateway/node-registry.ts` | Node session registry & invocation logic |
+| `src/gateway/server-node-events.ts` | Handles events from nodes |
+| `src/gateway/node-command-policy.ts` | Command allowlists & platform policies |
+| `src/gateway/server-mobile-nodes.ts` | Mobile-specific node utilities |
+| `src/infra/node-pairing.ts` | Device pairing logic |
+| `src/infra/node-shell.ts` | Shell execution on nodes |
+| `src/cli/nodes-cli.ts` | CLI commands for node management |
 
 ---
 
