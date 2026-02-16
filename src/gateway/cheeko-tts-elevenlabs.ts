@@ -1,14 +1,14 @@
 import OpusScript from "opusscript";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
-import type { CheekTtsCallbacks, CheekTtsHandle } from "./cheeko-tts.js";
 import type { CheekAudioFormat, CheekStreamLog } from "./cheeko-stream.js";
+import { paceFrames, type CheekTtsCallbacks, type CheekTtsHandle } from "./cheeko-tts.js";
 
-/** 24kHz, mono, 20ms frame → 480 samples per frame, 2 bytes per sample = 960 bytes per frame. */
+/** 24kHz, mono, 60ms frame → 1440 samples per frame, 2 bytes per sample = 2880 bytes per frame. */
 const TTS_SAMPLE_RATE = 24000;
 const TTS_CHANNELS = 1;
-const FRAME_DURATION_MS = 20;
-const FRAME_SIZE = (TTS_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 480 samples
-const FRAME_BYTE_SIZE = FRAME_SIZE * TTS_CHANNELS * 2; // 960 bytes (16-bit PCM)
+const FRAME_DURATION_MS = 60;
+const FRAME_SIZE = (TTS_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 1440 samples
+const FRAME_BYTE_SIZE = FRAME_SIZE * TTS_CHANNELS * 2; // 2880 bytes (16-bit PCM)
 
 const DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io";
 const DEFAULT_ELEVENLABS_VOICE_ID = "pMsXgVXv3BLzUgSXRplE";
@@ -35,7 +35,8 @@ export function streamElevenLabsTts(opts: {
   const outputFormat = opts.outputFormat ?? "opus";
   const abortController = new AbortController();
 
-  const apiKey = config.elevenlabsApiKey || process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY;
+  const apiKey =
+    config.elevenlabsApiKey || process.env.ELEVENLABS_API_KEY || process.env.XI_API_KEY;
   if (!apiKey) {
     callbacks.onError("ElevenLabs API key not configured");
     return { abort: () => {} };
@@ -97,34 +98,43 @@ export function streamElevenLabsTts(opts: {
       if (outputFormat === "pcm") {
         // Send raw PCM directly to web clients
         callbacks.onAudioFrame(pcmBuffer);
+        if (!abortController.signal.aborted) {
+          callbacks.onSentenceDone();
+        }
       } else {
-        // Encode to Opus for native clients
+        // Encode all frames first, then pace delivery
+        const opusFrames: Buffer[] = [];
         let offset = 0;
         while (offset + FRAME_BYTE_SIZE <= pcmBuffer.length) {
-          if (abortController.signal.aborted) break;
           const frame = pcmBuffer.subarray(offset, offset + FRAME_BYTE_SIZE);
-          const opusFrame = encoder!.encode(frame, FRAME_SIZE);
-          callbacks.onAudioFrame(Buffer.from(opusFrame));
+          opusFrames.push(Buffer.from(encoder!.encode(frame, FRAME_SIZE)));
           offset += FRAME_BYTE_SIZE;
         }
-        // Encode any remaining partial frame (pad with silence)
-        if (offset < pcmBuffer.length && !abortController.signal.aborted) {
-          const remaining = pcmBuffer.subarray(offset);
+        if (offset < pcmBuffer.length) {
           const padded = Buffer.alloc(FRAME_BYTE_SIZE);
-          remaining.copy(padded);
-          const opusFrame = encoder!.encode(padded, FRAME_SIZE);
-          callbacks.onAudioFrame(Buffer.from(opusFrame));
+          pcmBuffer.subarray(offset).copy(padded);
+          opusFrames.push(Buffer.from(encoder!.encode(padded, FRAME_SIZE)));
         }
         encoder!.delete();
         encoder = null;
-      }
 
-      if (!abortController.signal.aborted) {
-        callbacks.onSentenceDone();
+        // Pace frames at real-time rate so the device buffer doesn't overflow
+        await paceFrames(
+          opusFrames,
+          FRAME_DURATION_MS,
+          abortController.signal,
+          callbacks.onAudioFrame,
+        );
+
+        if (!abortController.signal.aborted) {
+          callbacks.onSentenceDone();
+        }
       }
     } catch (err: unknown) {
       encoder?.delete();
-      if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) {
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`cheeko-tts-elevenlabs: error: ${msg}`);
       callbacks.onError(msg);

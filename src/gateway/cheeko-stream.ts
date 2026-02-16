@@ -3,14 +3,17 @@ import type { Duplex } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
-import { createSttStream, type CheekSttStream } from "./cheeko-stt.js";
 import { sendChatMessage, type CheekChatHandle } from "./cheeko-chat.js";
+import { createSttStream, type CheekSttStream } from "./cheeko-stt.js";
 import { createTtsPipeline } from "./cheeko-tts.js";
 
 export const CHEEKO_STREAM_PATH = "/cheeko/stream";
 
 /** Audio format negotiated per connection. */
 export type CheekAudioFormat = "opus" | "pcm";
+
+/** How long to keep a Deepgram connection alive after speech ends (ms). */
+const STT_KEEP_ALIVE_MS = 60_000;
 
 /** Per-connection session state. */
 export type CheekStreamSession = {
@@ -24,6 +27,10 @@ export type CheekStreamSession = {
   audioFormat: CheekAudioFormat;
   /** Active Deepgram STT stream (created on first audio chunk). */
   sttStream: CheekSttStream | null;
+  /** Timer to close the STT stream after keep-alive period. */
+  sttKeepAliveTimer: ReturnType<typeof setTimeout> | null;
+  /** Interval sending keep-alive pings to Deepgram while idle. */
+  sttKeepAlivePinger: ReturnType<typeof setInterval> | null;
   /** Accumulated final transcript segments for the current utterance. */
   finalTranscript: string;
   /** Active LLM chat handle (for abort support). */
@@ -49,8 +56,16 @@ export type CheekStreamLog = {
 };
 
 type ControlMessage =
-  | { type: "hello"; deviceId?: string; token?: string; clientType?: string;
-      transport?: string; audio_params?: Record<string, unknown>; version?: number; features?: Record<string, unknown> }
+  | {
+      type: "hello";
+      deviceId?: string;
+      token?: string;
+      clientType?: string;
+      transport?: string;
+      audio_params?: Record<string, unknown>;
+      version?: number;
+      features?: Record<string, unknown>;
+    }
   | { type: "speech_end" }
   | { type: "cancel" }
   | { type: "listen"; state: string; mode?: string }
@@ -204,14 +219,15 @@ export function createCheekStreamHandler(opts: {
     }
 
     // Detect ESP32 clients by checking for fields that only ESP32 firmware sends
-    const isEsp32 = msg.transport === "websocket" || msg.audio_params != null || typeof msg.version === "number";
+    const isEsp32 =
+      msg.transport === "websocket" || msg.audio_params != null || typeof msg.version === "number";
 
     const deviceId = isEsp32
-      ? (req.headers["device-id"] as string || `esp32-${randomUUID().slice(0, 8)}`)
-      : (msg.deviceId || `device-${randomUUID().slice(0, 8)}`);
+      ? (req.headers["device-id"] as string) || `esp32-${randomUUID().slice(0, 8)}`
+      : msg.deviceId || `device-${randomUUID().slice(0, 8)}`;
     const audioFormat: CheekAudioFormat = msg.clientType === "web" ? "pcm" : "opus";
     const protocolVersion = isEsp32
-      ? ((msg.version ?? Number(req.headers["protocol-version"])) || 1)
+      ? (msg.version ?? Number(req.headers["protocol-version"])) || 1
       : 1;
     const sessionId = randomUUID();
     const session: CheekStreamSession = {
@@ -223,6 +239,8 @@ export function createCheekStreamHandler(opts: {
       createdAt: Date.now(),
       audioFormat,
       sttStream: null,
+      sttKeepAliveTimer: null,
+      sttKeepAlivePinger: null,
       finalTranscript: "",
       chatHandle: null,
       ttsPipeline: null,
@@ -233,7 +251,9 @@ export function createCheekStreamHandler(opts: {
       esp32ListeningMode: "manual",
     };
     sessions.set(ws, session);
-    log.info(`cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat}, esp32: ${isEsp32}, proto: ${protocolVersion})`);
+    log.info(
+      `cheeko: session ${sessionId} started for device ${deviceId} (audio: ${audioFormat}, esp32: ${isEsp32}, proto: ${protocolVersion})`,
+    );
 
     if (isEsp32) {
       // Respond in the format ESP32 firmware expects
@@ -245,7 +265,7 @@ export function createCheekStreamHandler(opts: {
           format: "opus",
           sample_rate: 24000,
           channels: 1,
-          frame_duration: 20,
+          frame_duration: 60,
         },
       });
       // ESP32 does not expect status:idle after hello
@@ -260,8 +280,14 @@ export function createCheekStreamHandler(opts: {
   }
 
   function ensureSttStream(session: CheekStreamSession): CheekSttStream | null {
-    // Return existing stream even if still connecting (avoid creating duplicates)
-    if (session.sttStream) return session.sttStream;
+    // Reuse existing stream — cancel pending keep-alive close timer
+    if (session.sttStream) {
+      if (session.sttKeepAliveTimer) {
+        clearTimeout(session.sttKeepAliveTimer);
+        session.sttKeepAliveTimer = null;
+      }
+      return session.sttStream;
+    }
 
     const config = getConfig();
     if (!config) {
@@ -277,7 +303,9 @@ export function createCheekStreamHandler(opts: {
         audioFormat: session.audioFormat,
         onTranscript(text, isFinal) {
           if (session.isEsp32Client) {
-            if (isFinal) sendEsp32Json(session, { type: "stt", text });
+            if (isFinal) {
+              sendEsp32Json(session, { type: "stt", text });
+            }
           } else {
             sendJson(session.ws, { type: "transcript", text, partial: !isFinal });
           }
@@ -350,7 +378,7 @@ export function createCheekStreamHandler(opts: {
     // The STT stream will deliver remaining transcripts via onTranscript callback.
     // Give Deepgram up to 2s to flush, then proceed with whatever we have.
     const waitForTranscript = () => {
-      closeSttStream(session);
+      deferCloseSttStream(session);
 
       const transcript = session.finalTranscript.trim();
       if (transcript) {
@@ -372,7 +400,6 @@ export function createCheekStreamHandler(opts: {
   }
 
   function proceedWithTranscript(session: CheekStreamSession, transcript: string) {
-
     // Add user message to conversation history
     session.chatHistory.push({ role: "user", content: transcript });
 
@@ -383,14 +410,20 @@ export function createCheekStreamHandler(opts: {
     // Create TTS pipeline to stream audio back to client
     const config = getConfig();
     if (config) {
+      let frameCount = 0;
+      let totalBytes = 0;
       const onAudioFrame = (frame: Buffer) => {
         if (session.ws.readyState === WebSocket.OPEN) {
           if (!session.firstAudioSent && session.speechEndAt > 0) {
             const latencyMs = Date.now() - session.speechEndAt;
-            log.info(`cheeko: session ${session.sessionId} latency speech_end→first_audio: ${latencyMs}ms`);
+            log.info(
+              `cheeko: session ${session.sessionId} latency speech_end→first_audio: ${latencyMs}ms`,
+            );
             sendJson(session.ws, { type: "latency", speechEndToFirstAudio: latencyMs });
             session.firstAudioSent = true;
           }
+          frameCount++;
+          totalBytes += frame.length;
           session.ws.send(frame);
         }
       };
@@ -401,14 +434,19 @@ export function createCheekStreamHandler(opts: {
         onAudioFrame,
         onComplete() {
           session.ttsPipeline = null;
-          if (session.isEsp32Client) {
-            sendEsp32Json(session, { type: "tts", state: "stop" });
-          } else {
-            sendJson(session.ws, { type: "audio_end" });
-            sendStatus(session.ws, "idle");
-          }
-          session.state = "idle";
-          log.info(`cheeko: session ${session.sessionId} TTS complete`);
+          // Delay to let the device finish playing buffered audio before signalling completion.
+          setTimeout(() => {
+            if (session.isEsp32Client) {
+              sendEsp32Json(session, { type: "tts", state: "stop" });
+            } else {
+              sendJson(session.ws, { type: "audio_end" });
+              sendStatus(session.ws, "idle");
+            }
+            session.state = "idle";
+            log.info(
+              `cheeko: session ${session.sessionId} TTS complete (${frameCount} frames, ${totalBytes} bytes, ~${((frameCount * 20) / 1000).toFixed(1)}s audio)`,
+            );
+          }, 1000);
         },
         onError(err) {
           session.ttsPipeline = null;
@@ -453,7 +491,9 @@ export function createCheekStreamHandler(opts: {
           } else {
             sendStatus(session.ws, "speaking");
           }
-          log.info(`cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars), streaming TTS`);
+          log.info(
+            `cheeko: session ${session.sessionId} LLM response complete (${fullText.length} chars), streaming TTS`,
+          );
           // Signal TTS that no more sentences will arrive
           if (session.ttsPipeline) {
             session.ttsPipeline.finish();
@@ -480,7 +520,34 @@ export function createCheekStreamHandler(opts: {
     });
   }
 
-  function closeSttStream(session: CheekStreamSession) {
+  /** Schedule the STT stream to close after the keep-alive period. */
+  /** Schedule the STT stream to close after the keep-alive period. KeepAlive pings are handled inside the STT stream itself. */
+  function deferCloseSttStream(session: CheekStreamSession) {
+    if (session.sttKeepAliveTimer) {
+      clearTimeout(session.sttKeepAliveTimer);
+      session.sttKeepAliveTimer = null;
+    }
+    if (!session.sttStream) {
+      return;
+    }
+
+    session.sttKeepAliveTimer = setTimeout(() => {
+      session.sttKeepAliveTimer = null;
+      forceCloseSttStream(session);
+      log.info(`cheeko: session ${session.sessionId} STT keep-alive expired, connection closed`);
+    }, STT_KEEP_ALIVE_MS);
+  }
+
+  /** Immediately close the STT stream and cancel any keep-alive timer. */
+  function forceCloseSttStream(session: CheekStreamSession) {
+    if (session.sttKeepAlivePinger) {
+      clearInterval(session.sttKeepAlivePinger);
+      session.sttKeepAlivePinger = null;
+    }
+    if (session.sttKeepAliveTimer) {
+      clearTimeout(session.sttKeepAliveTimer);
+      session.sttKeepAliveTimer = null;
+    }
     if (session.sttStream) {
       session.sttStream.close();
       session.sttStream = null;
@@ -489,9 +556,10 @@ export function createCheekStreamHandler(opts: {
 
   function handleCancel(session: CheekStreamSession) {
     log.info(`cheeko: session ${session.sessionId} cancel requested`);
-    closeSttStream(session);
+    deferCloseSttStream(session);
     abortChat(session);
     abortTts(session);
+    sendEsp32Json(session, { type: "tts", state: "stop" });
     session.state = "idle";
     sendStatus(session.ws, "idle");
   }
@@ -511,7 +579,7 @@ export function createCheekStreamHandler(opts: {
   }
 
   function cleanupSession(session: CheekStreamSession) {
-    closeSttStream(session);
+    forceCloseSttStream(session);
     abortChat(session);
     abortTts(session);
     sessions.delete(session.ws);
@@ -526,7 +594,9 @@ export function createCheekStreamHandler(opts: {
     const config = getConfig();
     log.info(`cheeko: handleUpgrade config=${JSON.stringify(config ?? null)}`);
     if (!config?.enabled) {
-      log.warn(`cheeko: rejecting upgrade — enabled=${config?.enabled}, config exists=${config != null}`);
+      log.warn(
+        `cheeko: rejecting upgrade — enabled=${config?.enabled}, config exists=${config != null}`,
+      );
       socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return true;
