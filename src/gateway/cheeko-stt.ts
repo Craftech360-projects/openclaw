@@ -1,5 +1,5 @@
-import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 import type { ListenLiveClient } from "@deepgram/sdk";
+import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 import type { CheekStreamConfig } from "../config/types.gateway.js";
 import type { CheekAudioFormat, CheekStreamLog } from "./cheeko-stream.js";
 
@@ -14,6 +14,8 @@ export type CheekSttStream = {
   close: () => void;
   /** Whether the Deepgram connection is open and ready. */
   isConnected: () => boolean;
+  /** Send a keep-alive ping to prevent Deepgram from closing the connection. */
+  keepAlive: () => void;
 };
 
 /**
@@ -61,6 +63,7 @@ export function createSttStream(opts: {
   let closed = false;
   let ready = false;
   const pendingFrames: (ArrayBuffer | SharedArrayBuffer)[] = [];
+  let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 
   connection.on(LiveTranscriptionEvents.Open, () => {
     log.info("cheeko-stt: Deepgram connection opened");
@@ -70,11 +73,30 @@ export function createSttStream(opts: {
       connection.send(frame);
     }
     pendingFrames.length = 0;
+
+    // Send keepAlive every 3s for the lifetime of the connection
+    // Prevents Deepgram from closing when ESP32 VAD pauses audio
+    keepAliveInterval = setInterval(() => {
+      if (closed) {
+        if (keepAliveInterval) {
+          clearInterval(keepAliveInterval);
+          keepAliveInterval = null;
+        }
+        return;
+      }
+      try {
+        connection.keepAlive();
+      } catch {
+        // ignore
+      }
+    }, 3000);
   });
 
   connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
     const transcript: string = data?.channel?.alternatives?.[0]?.transcript ?? "";
-    if (!transcript) return;
+    if (!transcript) {
+      return;
+    }
 
     const isFinal: boolean = !!data.is_final;
     onTranscript(transcript, isFinal);
@@ -96,13 +118,22 @@ export function createSttStream(opts: {
   connection.on(LiveTranscriptionEvents.Close, () => {
     log.info("cheeko-stt: Deepgram connection closed");
     closed = true;
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
+      keepAliveInterval = null;
+    }
     onClose();
   });
 
   return {
     sendAudio(opusFrame: Buffer) {
-      if (closed) return;
-      const ab = opusFrame.buffer.slice(opusFrame.byteOffset, opusFrame.byteOffset + opusFrame.byteLength);
+      if (closed) {
+        return;
+      }
+      const ab = opusFrame.buffer.slice(
+        opusFrame.byteOffset,
+        opusFrame.byteOffset + opusFrame.byteLength,
+      );
       if (ready) {
         connection.send(ab);
       } else {
@@ -112,13 +143,21 @@ export function createSttStream(opts: {
     },
 
     finalize() {
-      if (closed || !ready) return;
+      if (closed || !ready) {
+        return;
+      }
       connection.finalize();
     },
 
     close() {
-      if (closed) return;
+      if (closed) {
+        return;
+      }
       closed = true;
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
       try {
         connection.requestClose();
       } catch {
@@ -128,6 +167,17 @@ export function createSttStream(opts: {
 
     isConnected() {
       return !closed && connection.isConnected();
+    },
+
+    keepAlive() {
+      if (closed || !ready) {
+        return;
+      }
+      try {
+        connection.keepAlive();
+      } catch {
+        // ignore keepAlive errors
+      }
     },
   };
 }

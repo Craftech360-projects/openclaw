@@ -4,12 +4,12 @@ import type { CheekStreamConfig } from "../config/types.gateway.js";
 import type { CheekAudioFormat, CheekStreamLog } from "./cheeko-stream.js";
 import { streamElevenLabsTts } from "./cheeko-tts-elevenlabs.js";
 
-/** 24kHz, mono, 20ms frame → 480 samples per frame, 2 bytes per sample = 960 bytes per frame. */
+/** 24kHz, mono, 60ms frame → 1440 samples per frame, 2 bytes per sample = 2880 bytes per frame. */
 const TTS_SAMPLE_RATE = 24000;
 const TTS_CHANNELS = 1;
-const FRAME_DURATION_MS = 20;
-const FRAME_SIZE = (TTS_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 480 samples
-const FRAME_BYTE_SIZE = FRAME_SIZE * TTS_CHANNELS * 2; // 960 bytes (16-bit PCM)
+const FRAME_DURATION_MS = 60;
+const FRAME_SIZE = (TTS_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 1440 samples
+const FRAME_BYTE_SIZE = FRAME_SIZE * TTS_CHANNELS * 2; // 2880 bytes (16-bit PCM)
 
 export type CheekTtsCallbacks = {
   /** Called with each audio frame (Opus or raw PCM) ready to send over WebSocket. */
@@ -33,6 +33,30 @@ function createOpusEncoder(): OpusScript {
   const encoder = new OpusScript(TTS_SAMPLE_RATE, TTS_CHANNELS, OpusScript.Application.VOIP);
   encoder.setBitrate(32000); // 32kbps — good quality for voice
   return encoder;
+}
+
+/**
+ * Delivers Opus frames at real-time rate to avoid overwhelming device buffers.
+ * Sends one frame every `frameDurationMs` milliseconds.
+ */
+export function paceFrames(
+  frames: Buffer[],
+  frameDurationMs: number,
+  signal: AbortSignal,
+  onFrame: (frame: Buffer) => void,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let i = 0;
+    const send = () => {
+      if (signal.aborted || i >= frames.length) {
+        resolve();
+        return;
+      }
+      onFrame(frames[i++]);
+      setTimeout(send, frameDurationMs);
+    };
+    send();
+  });
 }
 
 /**
@@ -87,14 +111,12 @@ function streamOpenAiTts(opts: {
       }
 
       // Request PCM output for streaming — raw 24kHz 16-bit mono PCM
-      const response = await openai.audio.speech.create(
-        {
-          model,
-          voice,
-          input: text,
-          response_format: "pcm",
-        },
-      );
+      const response = await openai.audio.speech.create({
+        model,
+        voice,
+        input: text,
+        response_format: "pcm",
+      });
 
       if (abortController.signal.aborted) {
         encoder?.delete();
@@ -114,34 +136,43 @@ function streamOpenAiTts(opts: {
       if (outputFormat === "pcm") {
         // Send raw PCM directly to web clients
         callbacks.onAudioFrame(pcmBuffer);
+        if (!abortController.signal.aborted) {
+          callbacks.onSentenceDone();
+        }
       } else {
-        // Encode to Opus for native clients
+        // Encode all frames first, then pace delivery
+        const opusFrames: Buffer[] = [];
         let offset = 0;
         while (offset + FRAME_BYTE_SIZE <= pcmBuffer.length) {
-          if (abortController.signal.aborted) break;
           const frame = pcmBuffer.subarray(offset, offset + FRAME_BYTE_SIZE);
-          const opusFrame = encoder!.encode(frame, FRAME_SIZE);
-          callbacks.onAudioFrame(Buffer.from(opusFrame));
+          opusFrames.push(Buffer.from(encoder!.encode(frame, FRAME_SIZE)));
           offset += FRAME_BYTE_SIZE;
         }
-        // Encode any remaining partial frame (pad with silence)
-        if (offset < pcmBuffer.length && !abortController.signal.aborted) {
-          const remaining = pcmBuffer.subarray(offset);
+        if (offset < pcmBuffer.length) {
           const padded = Buffer.alloc(FRAME_BYTE_SIZE);
-          remaining.copy(padded);
-          const opusFrame = encoder!.encode(padded, FRAME_SIZE);
-          callbacks.onAudioFrame(Buffer.from(opusFrame));
+          pcmBuffer.subarray(offset).copy(padded);
+          opusFrames.push(Buffer.from(encoder!.encode(padded, FRAME_SIZE)));
         }
         encoder!.delete();
         encoder = null;
-      }
 
-      if (!abortController.signal.aborted) {
-        callbacks.onSentenceDone();
+        // Pace frames at real-time rate so the device buffer doesn't overflow
+        await paceFrames(
+          opusFrames,
+          FRAME_DURATION_MS,
+          abortController.signal,
+          callbacks.onAudioFrame,
+        );
+
+        if (!abortController.signal.aborted) {
+          callbacks.onSentenceDone();
+        }
       }
     } catch (err: unknown) {
       encoder?.delete();
-      if (abortController.signal.aborted) return;
+      if (abortController.signal.aborted) {
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       log.warn(`cheeko-tts: error: ${msg}`);
       callbacks.onError(msg);
@@ -184,7 +215,9 @@ export function createTtsPipeline(opts: {
   let aborted = false;
 
   function processNext() {
-    if (aborted) return;
+    if (aborted) {
+      return;
+    }
 
     if (queue.length === 0) {
       if (finished) {
@@ -203,7 +236,9 @@ export function createTtsPipeline(opts: {
       outputFormat,
       callbacks: {
         onAudioFrame(frame) {
-          if (!aborted) onAudioFrame(frame);
+          if (!aborted) {
+            onAudioFrame(frame);
+          }
         },
         onSentenceDone() {
           activeTts = null;
@@ -211,7 +246,9 @@ export function createTtsPipeline(opts: {
         },
         onError(err) {
           activeTts = null;
-          if (!aborted) onError(err);
+          if (!aborted) {
+            onError(err);
+          }
         },
       },
     });
@@ -219,7 +256,9 @@ export function createTtsPipeline(opts: {
 
   return {
     pushSentence(text: string) {
-      if (aborted || finished) return;
+      if (aborted || finished) {
+        return;
+      }
       queue.push(text);
       // Start processing if nothing is active
       if (!activeTts) {
@@ -227,7 +266,9 @@ export function createTtsPipeline(opts: {
       }
     },
     finish() {
-      if (aborted) return;
+      if (aborted) {
+        return;
+      }
       finished = true;
       // If nothing is active, complete immediately
       if (!activeTts && queue.length === 0) {
